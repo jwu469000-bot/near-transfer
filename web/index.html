@@ -79,7 +79,7 @@
           <div class="pair-heading">
             <div>
               <h2 id="pair-heading">手机扫码连接</h2>
-              <p id="pair-subtitle">用近传 App 或手机相机扫描二维码</p>
+              <p id="pair-subtitle">用安卓近传 App 扫码，绑定一次即可</p>
             </div>
             <span class="scan-mark" aria-hidden="true"><span class="icon i-scan"></span></span>
           </div>
@@ -108,7 +108,7 @@
               <span class="pair-code" id="manual-code" hidden>配对码 <strong id="code-digits"></strong></span>
             </div>
             <button class="pair-button" id="copy-link" type="button" disabled><span class="icon i-copy" aria-hidden="true"></span>复制链接</button>
-            <button class="pair-button" id="reset-pair" type="button" hidden><span class="icon i-refresh" aria-hidden="true"></span>更换连接</button>
+            <button class="pair-button" id="reset-pair" type="button" hidden><span class="icon i-refresh" aria-hidden="true"></span>解除绑定</button>
           </div>
           <input class="manual-link" id="manual-link" aria-label="手机连接链接" type="text" readonly hidden>
         </section>
@@ -150,11 +150,11 @@
     <h2 id="help-title">使用近传</h2>
     <ol class="steps">
       <li>让电脑和手机连上同一个 Wi‑Fi。</li>
-      <li>打开安卓端近传扫码，也可用手机相机扫码后在浏览器打开。</li>
-      <li>在任意一端选择文件，另一端在传输记录中点“下载”。</li>
+      <li>打开安卓端近传扫码。开启两端近传后，已绑定的手机会自动重连。</li>
+      <li>电脑能拖入文件发送。手机发来的文件会自动进入电脑收件箱。</li>
     </ol>
     <p>搜不到电脑时，检查 Windows 防火墙是否允许近传接收连接。网络隔离也可能阻止两台设备互访。</p>
-    <p>关闭电脑上的近传程序会清理本次中转文件。请先下载需要保留的文件。</p>
+    <p>关闭近传会结束本次文件传输。设备绑定和电脑收件箱会保存。</p>
     {{if $desktop}}
     <div class="dialog-actions">
       <button class="outline-button" id="new-connection" type="button">生成新二维码</button>

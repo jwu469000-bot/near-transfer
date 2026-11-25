@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,97 +24,132 @@ type endpoint struct {
 	subnet  *net.IPNet
 }
 
-func (e endpoint) desktop() bool { return e.subnet == nil }
-
 func main() {
 	port := flag.Int("port", 47331, "Preferred HTTP port (0 chooses a free port)")
-	noOpen := flag.Bool("no-open", false, "Do not open a browser")
+	noOpen := flag.Bool("no-open", false, "Run without the desktop widget")
+	dataDir := flag.String("data-dir", "", "Override the application data directory")
+	inbox := flag.String("inbox-dir", "", "Override the received files directory")
 	flag.Parse()
 
-	if err := run(*port, *noOpen); err != nil {
+	if *dataDir == "" {
+		*dataDir = filepath.Join(os.Getenv("LOCALAPPDATA"), "NearTransfer")
+	}
+	if *inbox == "" {
+		dir, err := downloadsFolder()
+		if err != nil {
+			home, _ := os.UserHomeDir()
+			dir = filepath.Join(home, "Downloads")
+		}
+		*inbox = filepath.Join(dir, "近传")
+	}
+	if err := run(*port, *noOpen, *dataDir, *inbox); err != nil {
 		fmt.Fprintln(os.Stderr, "NearTransfer:", err)
 		if !*noOpen {
-			fmt.Fprintln(os.Stderr, "Press Enter to close.")
-			fmt.Scanln()
+			widgetError("近传无法启动", err.Error())
 		}
 		os.Exit(1)
 	}
 }
 
-func run(port int, noOpen bool) error {
+func run(port int, noOpen bool, dataDir, inbox string) error {
 	if port < 0 || port > 65535 {
 		return errors.New("port must be 0–65535")
 	}
-	loopback, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if !noOpen {
+		release, err := claimWidget()
+		if err != nil || release == nil {
+			return err
+		}
+		defer release()
+	}
+	listener, err := net.Listen("tcp4", net.JoinHostPort("0.0.0.0", strconv.Itoa(port)))
 	if err != nil && port != 0 {
-		loopback, err = net.Listen("tcp4", "127.0.0.1:0")
+		listener, err = net.Listen("tcp4", "0.0.0.0:0")
 	}
 	if err != nil {
 		return err
 	}
-	defer loopback.Close()
-	port = loopback.Addr().(*net.TCPAddr).Port
+	defer listener.Close()
+	port = listener.Addr().(*net.TCPAddr).Port
 
-	h, err := newHub(port)
+	h, err := newHub(port, dataDir, inbox)
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(h.tempDir)
 
-	listeners := []net.Listener{loopback}
-	for _, e := range lanEndpoints(port) {
-		ln, err := net.Listen("tcp4", e.address)
-		if err == nil {
-			h.endpoints = append(h.endpoints, e)
-			listeners = append(listeners, ln)
-		}
-	}
-	servers := make([]*http.Server, 0, len(listeners))
-	serveErrors := make(chan error, len(listeners))
-	for i, ln := range listeners {
-		e := endpoint{address: ln.Addr().String()}
-		if i > 0 {
-			e = h.endpoints[i-1]
-		}
-		server := &http.Server{
-			Handler:           h.handler(e),
-			ReadHeaderTimeout: 8 * time.Second,
-			IdleTimeout:       30 * time.Second,
-			MaxHeaderBytes:    16 << 10,
-		}
-		servers = append(servers, server)
-		go func() {
-			serveErrors <- server.Serve(ln)
-		}()
+	h.endpoints = lanEndpoints(port)
+	desktop := h.handler(true)
+	phone := h.handler(false)
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			addr, _ := r.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr)
+			if addr != nil && addr.IP.IsLoopback() {
+				desktop.ServeHTTP(w, r)
+			} else {
+				phone.ServeHTTP(w, r)
+			}
+		}),
+		ReadHeaderTimeout: 8 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	pcURL := "http://" + loopback.Addr().String()
-	fmt.Println("NearTransfer")
-	fmt.Println("Open on this PC:", pcURL)
-	fmt.Printf("LAN addresses ready: %d\n", len(h.endpoints))
-	fmt.Println("Keep this window open. Press Ctrl+C to end the session.")
-	if !noOpen {
-		go func() {
-			if err := openBrowser(pcURL); err != nil {
-				log.Println("Open the address above in your browser:", err)
-			}
-		}()
-	}
+	pcURL := "http://127.0.0.1:" + strconv.Itoa(port)
+	serveErrors := make(chan error, 1)
+	go func() {
+		if err := server.Serve(listener); !errors.Is(err, http.ErrServerClosed) {
+			log.Println("NearTransfer:", err)
+			serveErrors <- err
+			h.beginShutdown()
+		}
+	}()
+	go h.watchNetwork(port)
+	stopDiscovery := h.startDiscovery()
+	defer stopDiscovery()
+	go func() {
+		select {
+		case <-ctx.Done():
+			h.beginShutdown()
+		case <-h.stop:
+		}
+	}()
 
-	select {
-	case <-ctx.Done():
-	case <-h.stop:
-	case err = <-serveErrors:
+	fmt.Println("NearTransfer:", pcURL)
+	if noOpen {
+		<-h.stop
+	} else {
+		err = showWidget(h, pcURL)
 	}
-
 	h.beginShutdown()
-	for _, server := range servers {
-		server.Close()
-	}
+	server.Close()
 	h.fileOperations.Wait()
+	select {
+	case serveErr := <-serveErrors:
+		if err == nil {
+			err = serveErr
+		}
+	default:
+	}
 	return err
+}
+
+func (h *hub) watchNetwork(port int) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-h.stop:
+			return
+		case <-ticker.C:
+			endpoints := lanEndpoints(port)
+			h.mu.Lock()
+			h.endpoints = endpoints
+			h.mu.Unlock()
+		}
+	}
 }
 
 var carrierSubnet = &net.IPNet{

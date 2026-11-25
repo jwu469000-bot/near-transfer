@@ -143,7 +143,7 @@ async function connectPhone() {
 }
 
 function paintPairing() {
-  const { links, paired, online, room, manualCode } = snapshot;
+  const { links, paired, bound, online, room, manualCode } = snapshot;
   element("open-installer").hidden = !snapshot.installer;
   const select = element("network-choice");
   const linkKey = JSON.stringify(links.map((link) => link.address));
@@ -162,7 +162,9 @@ function paintPairing() {
   element("copy-link").disabled = !scanning;
   element("reset-pair").hidden = !paired;
   element("pair-heading").textContent = paired ? "设备连接" : "手机扫码连接";
-  element("pair-subtitle").textContent = paired ? "一台手机可与此电脑互传" : "用近传 App 或手机相机扫描二维码";
+  element("pair-subtitle").textContent = paired
+    ? (bound ? "本机已记住这台安卓设备" : "当前浏览器会话可互传文件")
+    : "用安卓近传 App 扫码，绑定一次即可";
   element("manual-code").hidden = !scanning;
   element("code-digits").textContent = manualCode ? manualCode.slice(0, 3) + " " + manualCode.slice(3) : "";
   select.hidden = !scanning || links.length < 2;
@@ -174,7 +176,7 @@ function paintPairing() {
   manual.value = selectedLink?.url || "";
 
   if (scanning) {
-    const src = "/api/qr?index=" + selectedNetwork + "&room=" + room;
+    const src = "/api/qr?index=" + selectedNetwork + "&room=" + room + "&address=" + encodeURIComponent(selectedLink.address);
     const qr = element("qr");
     if (qr.getAttribute("src") !== src) {
       qr.hidden = true;
@@ -183,7 +185,7 @@ function paintPairing() {
   }
   if (paired) {
     element("paired-label").textContent = online ? "手机已连接" : "手机暂离";
-    element("paired-detail").textContent = online ? "现在可以双向收发文件" : "在手机上打开近传即可恢复";
+    element("paired-detail").textContent = online ? "现在可以双向收发文件" : (bound ? "打开手机近传会自动重连" : "在手机上打开近传即可恢复");
     setStatus(online ? "connected" : "offline", online ? "手机已连接" : "手机暂离");
   } else {
     setStatus(scanning ? "ready" : "offline", scanning ? "等待手机连接" : "未发现局域网");
@@ -454,7 +456,7 @@ if (isDesktop) {
     confirm.showModal();
   }
   function askReset() {
-    ask("生成新二维码", "当前设备会断开，传输记录和中转文件将清空。请先下载要保留的文件。", "生成二维码", async () => {
+    ask(snapshot?.paired ? "解除当前绑定" : "生成新二维码", "当前连接将结束。请先下载要保留的待收文件。", "生成二维码", async () => {
       await api("/api/reset", "POST");
       clearQueue();
       await refresh();
@@ -464,7 +466,7 @@ if (isDesktop) {
   element("reset-pair").addEventListener("click", askReset);
   element("new-connection").addEventListener("click", askReset);
   element("stop-service").addEventListener("click", () => {
-    ask("结束本次传输", "所有设备将断开，中转文件将清理。请先下载要保留的文件。", "结束传输", async () => {
+    ask("退出近传", "当前传输会结束。请先下载要保留的待收文件。", "退出近传", async () => {
       await api("/api/stop", "POST");
       stopped = true;
       ready = false;

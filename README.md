@@ -1,19 +1,23 @@
-# 近传
+# 近传 1.1
 
-近传在同一局域网内连接一台电脑与一台手机。电脑端支持 Windows 10/11 x64，安卓端支持 Android 8.0 及以上。手机也可以用浏览器扫码连接。
+近传给固定的一台 Windows 电脑和一台安卓手机互传文件。电脑端支持 Windows 10/11 x64，安卓端支持 Android 8.0 及以上。
 
-[下载安装包](https://github.com/jwu469000-bot/near-transfer/releases/tag/v1.0.0)
+[下载安装包](https://github.com/jwu469000-bot/near-transfer/releases/tag/v1.1.0)
 
 ## 开始使用
 
-1. 让手机和电脑连上同一个 Wi‑Fi，双击运行 **NearTransfer-Windows-1.0.0.exe**。工作台会在电脑浏览器中打开。
-2. 点击工作台右上角的 **安装安卓端**，用手机相机扫描安装二维码并下载 APK。也可直接安装 **NearTransfer-Android-1.0.0.apk**。
-3. 打开安卓端近传，用 **打开相机** 扫描工作台上的配对二维码。也可以填写二维码下方的电脑地址与六位配对码。
-4. 在任意一端选择文件。电脑端也支持拖放。接收方在 **传输记录** 中点 **下载**。安卓会让你选择保存位置。
+1. 让两台设备连上同一个 Wi‑Fi。双击 **NearTransfer-Windows-1.1.0.exe**，桌面右下角会出现小摆件。
+2. 点小摆件里的 **扫码配对手机** 打开设置页。可点 **安装安卓端**，用手机相机扫码下载 APK，也可直接安装 **NearTransfer-Android-1.1.0.apk**。
+3. 在安卓 App 里扫设置页上的配对二维码。也可以填页面显示的电脑地址和六位配对码。首次绑定完成后，每次打开两端近传就会自动重连。
 
-更换设备时，在电脑端点 **更换连接**。正常结束程序会清理电脑上的中转文件，请先下载要保留的文件。
+1. 从电脑发送时，把文件拖进小摆件，或点击中间的发送区多选。随后在手机上下载保存。
+2. 从手机发送时，用 App 的系统选择器选择文件。送达后文件自动存进电脑的 **下载\近传**，可由小摆件底部的 **收件箱** 打开。遇到同名文件会另存一份。
 
-如果扫码后无法访问电脑，可检查 Windows 防火墙是否允许近传在当前网络上接收连接，以及 Wi‑Fi 是否开启设备隔离。电脑更换网络后，请重新打开近传以更新地址。文件通过当前局域网的 HTTP 连接传输。
+拖动小摆件的标题区可改变位置。右上角的菜单可以切换置顶、选择登录 Windows 时打开、解除绑定或退出近传。升级自 1.0.0 时，请用两个 1.1.0 客户端完成首次绑定。
+
+已绑定的手机会优先尝试上次连通的电脑地址，并在需要时尝试在局域网内发现电脑。网络限制发现时，安卓 App 的 **连接设置 → 更新电脑地址** 可以手动填入小摆件设置页上的新地址，继续使用当前绑定。
+
+无法访问时，请检查 Windows 防火墙是否允许近传接收连接，以及 Wi‑Fi 是否开启设备隔离。文件通过当前局域网的 HTTP 连接传输。设备绑定和电脑收件箱会保留，电脑发出的待下载文件需在退出近传前保存。
 
 ## 从源码构建
 
@@ -22,7 +26,7 @@
 在 Windows x64 上安装 Go 1.24 或更新版本，从源码目录运行。
 
 ```powershell
-go build -trimpath -ldflags "-s -w" -o NearTransfer-Windows-1.0.0.exe .
+go build -trimpath -ldflags "-H windowsgui -s -w" -o NearTransfer-Windows-1.1.0.exe .
 ```
 
 将已签名的 APK 放在 `web/install/near-transfer-android.apk` 后再构建，工作台即可提供安卓安装二维码。可使用对应版本发布页中的 APK。
@@ -34,7 +38,7 @@ go build -trimpath -ldflags "-s -w" -o NearTransfer-Windows-1.0.0.exe .
 设置 `ANDROID_HOME`、`JAVA_HOME` 和签名密码环境变量 `NEAR_SIGN_PASSWORD`，然后运行。
 
 ```powershell
-python android/build.py --keystore <你的签名文件.p12> --alias <密钥别名> --output NearTransfer-Android-1.0.0.apk
+python android/build.py --keystore .\near-transfer.p12 --alias near-transfer --output NearTransfer-Android-1.1.0.apk
 ```
 
 后续覆盖安装需使用与原安装包相同的签名证书。

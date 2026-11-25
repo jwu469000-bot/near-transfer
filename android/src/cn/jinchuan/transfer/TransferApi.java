@@ -35,12 +35,24 @@ final class TransferApi {
     }
 
     static final class Session {
-        final String origin;
-        final String cookie;
+        final String id;
+        final String key;
+        volatile Route route;
 
-        Session(String origin, String cookie) {
+        Session(String origin, String id, String key) {
+            this.id = id;
+            this.key = key;
+            route = new Route(origin, null);
+        }
+    }
+
+    static final class Route {
+        final String origin;
+        final String ticket;
+
+        Route(String origin, String ticket) {
             this.origin = origin;
-            this.cookie = cookie;
+            this.ticket = ticket;
         }
     }
 
@@ -103,17 +115,22 @@ final class TransferApi {
             throw new IllegalArgumentException("请输入电脑上显示的六位配对码。");
         }
         try {
-            URI uri = URI.create(address.startsWith("http://") ? address : "http://" + address);
-            return new Target(localOrigin(uri), digits);
+            return new Target(addressOrigin(address), digits);
         } catch (IllegalArgumentException badAddress) {
             throw new IllegalArgumentException("请输入电脑上显示的局域网地址，例如 192.168.1.20:47331。");
         }
     }
 
-    static Session restore(String origin, String cookie) {
-        if (origin == null || cookie == null || !cookie.matches("near_phone_[0-9]{1,5}=[a-f0-9]{48}")) return null;
+    static String addressOrigin(String address) {
+        String entered = address.trim();
+        URI uri = URI.create(entered.startsWith("http://") ? entered : "http://" + entered);
+        return localOrigin(uri);
+    }
+
+    static Session restore(String origin, String id, String key) {
+        if (origin == null || !DeviceDiscovery.hex(id, 48) || !DeviceDiscovery.hex(key, 48)) return null;
         try {
-            if (origin.equals(localOrigin(URI.create(origin)))) return new Session(origin, cookie);
+            if (origin.equals(localOrigin(URI.create(origin)))) return new Session(origin, id, key);
         } catch (IllegalArgumentException ignored) {
             // A saved address can be invalid after an upgrade.
         }
@@ -146,9 +163,11 @@ final class TransferApi {
     }
 
     static Session pair(Target target) throws IOException, JSONException {
+        Session session = new Session(target.origin, DeviceDiscovery.randomHex(24), DeviceDiscovery.randomHex(24));
         HttpURLConnection request = open(target.origin, "/api/pair", "POST", null);
         try {
-            byte[] body = new JSONObject().put("code", target.code).toString().getBytes(StandardCharsets.UTF_8);
+            byte[] body = new JSONObject().put("code", target.code).put("mode", "android")
+                    .put("id", session.id).put("key", session.key).toString().getBytes(StandardCharsets.UTF_8);
             request.setRequestProperty("Content-Type", "application/json");
             request.setFixedLengthStreamingMode(body.length);
             request.setDoOutput(true);
@@ -156,18 +175,44 @@ final class TransferApi {
                 out.write(body);
             }
             requireSuccess(request);
-            String header = request.getHeaderField("Set-Cookie");
-            String cookie = header == null ? "" : header.split(";", 2)[0];
-            Session session = restore(target.origin, cookie);
-            if (session == null) throw new IOException("电脑没有返回配对信息，请重试。");
+            try (InputStream in = request.getInputStream()) {
+                String epoch = new JSONObject(readText(in, 4096)).getString("epoch");
+                session.route = DeviceDiscovery.route(session, target.origin, epoch);
+            }
             return session;
+        } catch (HttpError rejected) {
+            throw rejected;
+        } catch (IOException | JSONException interrupted) {
+            try {
+                session.route = probe(session, target.origin);
+                return session;
+            } catch (IOException | JSONException unavailable) {
+                throw interrupted;
+            }
         } finally {
             request.disconnect();
         }
     }
 
     static State state(Session session) throws IOException, JSONException {
-        HttpURLConnection request = open(session.origin, "/api/state", "GET", session.cookie);
+        Route cached = session.route;
+        if (cached.ticket != null) {
+            try {
+                return readState(cached);
+            } catch (IOException | JSONException unavailable) {
+                // A desktop restart rotates its ticket. Probe the remembered address first.
+            }
+        }
+        Route found = findRoute(session, cached);
+        State state = readState(found);
+        if (session.route == cached) session.route = found;
+        return state;
+    }
+
+    private static State readState(Route route) throws IOException, JSONException {
+        HttpURLConnection request = open(route.origin, "/api/state", "GET", route.ticket);
+        request.setConnectTimeout(1500);
+        request.setReadTimeout(2500);
         try {
             requireSuccess(request);
             try (InputStream input = request.getInputStream()) {
@@ -178,9 +223,50 @@ final class TransferApi {
         }
     }
 
-    static void leave(Session session) throws IOException {
-        HttpURLConnection request = open(session.origin, "/api/leave", "POST", session.cookie);
+    private static Route findRoute(Session session, Route cached) throws IOException, JSONException {
         try {
+            return probe(session, cached.origin);
+        } catch (IOException | JSONException unavailable) {
+            return DeviceDiscovery.find(session, cached.origin);
+        }
+    }
+
+    private static Route probe(Session session, String origin) throws IOException, JSONException {
+        String nonce = DeviceDiscovery.randomHex(16);
+        HttpURLConnection request = open(origin, "/api/identity?id=" + session.id + "&nonce=" + nonce, "GET", null);
+        request.setConnectTimeout(950);
+        request.setReadTimeout(950);
+        try {
+            requireSuccess(request);
+            try (InputStream in = request.getInputStream()) {
+                JSONObject response = new JSONObject(readText(in, 4096));
+                String epoch = response.getString("epoch");
+                if (!DeviceDiscovery.check(session.key, response.getString("proof"), "host", origin, nonce, epoch)) {
+                    throw new IOException("电脑身份验证失败。");
+                }
+                return DeviceDiscovery.route(session, origin, epoch);
+            }
+        } finally {
+            request.disconnect();
+        }
+    }
+
+    static void leave(Session session) throws IOException, JSONException {
+        Route route = session.route;
+        if (route.ticket == null) route = findRoute(session, route);
+        try {
+            postLeave(route);
+        } catch (HttpError error) {
+            if (error.status != 401) throw error;
+            postLeave(findRoute(session, route));
+        }
+    }
+
+    private static void postLeave(Route route) throws IOException {
+        HttpURLConnection request = open(route.origin, "/api/leave", "POST", route.ticket);
+        try {
+            request.setConnectTimeout(1800);
+            request.setReadTimeout(2500);
             requireSuccess(request);
         } finally {
             request.disconnect();
@@ -188,7 +274,8 @@ final class TransferApi {
     }
 
     static void send(Session session, int room, FileAccess.Source source, Progress progress) throws IOException {
-        HttpURLConnection request = open(session.origin, "/api/upload", "POST", session.cookie);
+        Route route = session.route;
+        HttpURLConnection request = open(route.origin, "/api/upload", "POST", route.ticket);
         try {
             request.setDoOutput(true);
             request.setFixedLengthStreamingMode(source.size);
@@ -207,7 +294,8 @@ final class TransferApi {
 
     static void receive(Session session, Record record, FileAccess.Destination destination, Progress progress) throws IOException {
         if (!record.id.matches("[dp][a-f0-9]{32}")) throw new IOException("文件记录无效。");
-        HttpURLConnection request = open(session.origin, "/api/files/" + record.id, "GET", session.cookie);
+        Route route = session.route;
+        HttpURLConnection request = open(route.origin, "/api/files/" + record.id, "GET", route.ticket);
         try {
             requireSuccess(request);
             try (InputStream in = request.getInputStream(); OutputStream out = destination.open()) {
@@ -218,7 +306,7 @@ final class TransferApi {
         }
     }
 
-    private static HttpURLConnection open(String origin, String path, String method, String cookie) throws IOException {
+    private static HttpURLConnection open(String origin, String path, String method, String ticket) throws IOException {
         HttpURLConnection request = (HttpURLConnection) new URL(origin + path).openConnection(Proxy.NO_PROXY);
         request.setConnectTimeout(5500);
         request.setReadTimeout(20000);
@@ -226,7 +314,7 @@ final class TransferApi {
         request.setUseCaches(false);
         request.setRequestMethod(method);
         request.setRequestProperty("Accept-Encoding", "identity");
-        if (cookie != null) request.setRequestProperty("Cookie", cookie);
+        if (ticket != null) request.setRequestProperty("Authorization", "Bearer " + ticket);
         if ("POST".equals(method)) request.setRequestProperty("Origin", origin);
         return request;
     }

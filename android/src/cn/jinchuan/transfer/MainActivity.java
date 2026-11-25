@@ -96,7 +96,8 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle saved) {
         super.onCreate(saved);
         prefs = getSharedPreferences("near-transfer", MODE_PRIVATE);
-        session = TransferApi.restore(prefs.getString("origin", null), prefs.getString("cookie", null));
+        session = TransferApi.restore(prefs.getString("origin", null), prefs.getString("device-id", null),
+                prefs.getString("device-key", null));
         addressDraft = prefs.getString("last-address", "");
         if (saved != null && saved.containsKey("save-id")) {
             pendingSave = new TransferApi.Record(saved.getString("save-id"), saved.getString("save-name"),
@@ -197,9 +198,9 @@ public final class MainActivity extends Activity {
         text.setPadding(dp(5), 0, 0, 0);
         footer.addView(text, new LinearLayout.LayoutParams(0, -2, 1));
         if (session != null) {
-            Button disconnect = button("更换连接", MUTED, Color.TRANSPARENT, false);
-            disconnect.setOnClickListener(v -> askLeave());
-            footer.addView(disconnect, new LinearLayout.LayoutParams(-2, dp(44)));
+            Button settings = button("连接设置", MUTED, Color.TRANSPARENT, false);
+            settings.setOnClickListener(v -> showConnectionSettings());
+            footer.addView(settings, new LinearLayout.LayoutParams(-2, dp(44)));
         }
         add(page, footer, 12);
         setContentView(root);
@@ -217,7 +218,7 @@ public final class MainActivity extends Activity {
         LinearLayout titleRow = row();
         LinearLayout scannerText = column();
         add(scannerText, label("扫码连接", 21, WHITE, true), 0);
-        add(scannerText, label("扫描电脑上近传显示的二维码", 13, 0xffdedbf4, false), 5);
+        add(scannerText, label("配对一次，以后打开近传会自动连接", 13, 0xffdedbf4, false), 5);
         titleRow.addView(scannerText, new LinearLayout.LayoutParams(0, -2, 1));
         titleRow.addView(tile(R.drawable.near_scan, 0xff504886, 0xffe8e3ff, 44));
         add(scanner, titleRow, 0);
@@ -348,9 +349,9 @@ public final class MainActivity extends Activity {
                 updateUI(() -> {
                     pairing = false;
                     session = next;
-                    addressDraft = next.origin.substring("http://".length());
-                    prefs.edit().putString("origin", next.origin).putString("cookie", next.cookie)
-                            .putString("last-address", addressDraft).apply();
+                    addressDraft = next.route.origin.substring("http://".length());
+                    prefs.edit().putString("origin", next.route.origin).putString("device-id", next.id)
+                            .putString("device-key", next.key).putString("last-address", addressDraft).remove("cookie").apply();
                     showScreen();
                     poll();
                 });
@@ -373,10 +374,15 @@ public final class MainActivity extends Activity {
                 TransferApi.State next = TransferApi.state(current);
                 updateUI(() -> {
                     polling = false;
-                    if (session != current) return;
+                    if (session != current || current.route.ticket == null) return;
                     boolean recovered = !online;
                     state = next;
                     online = true;
+                    String origin = current.route.origin;
+                    if (!origin.equals(prefs.getString("origin", ""))) {
+                        addressDraft = origin.substring("http://".length());
+                        prefs.edit().putString("origin", origin).putString("last-address", addressDraft).apply();
+                    }
                     if (recovered) showHint("");
                     renderStatus();
                     renderFiles();
@@ -385,12 +391,8 @@ public final class MainActivity extends Activity {
                 updateUI(() -> {
                     polling = false;
                     if (session != current) return;
-                    if (error instanceof TransferApi.HttpError && ((TransferApi.HttpError) error).status == 401) {
-                        clearSession("连接已结束，请扫描新二维码。");
-                        return;
-                    }
                     online = false;
-                    showHint("正在重连电脑。请保持电脑上的近传程序开启。");
+                    showHint("电脑暂时离线。两端打开近传并连接同一 Wi‑Fi 后会自动重连。");
                     renderStatus();
                     renderFiles();
                 });
@@ -406,7 +408,7 @@ public final class MainActivity extends Activity {
             scan.setEnabled(!pairing);
             connect.setEnabled(!pairing);
         } else {
-            status.setText(online ? "已连接电脑" : "正在连接");
+            status.setText(online ? "已连接电脑" : "自动重连中");
             status.setTextColor(online ? GREEN : 0xff8a5b29);
             status.setBackground(surface(online ? MINT : 0xffffedd7, Color.TRANSPARENT, 99));
             chooseFiles.setEnabled(online && !transferring && !leaving);
@@ -554,7 +556,7 @@ public final class MainActivity extends Activity {
                     return;
                 }
             }
-            updateUI(() -> { if (session == current) finishProgress("已发送 " + files.size() + " 个文件。", false); });
+            updateUI(() -> { if (session == current) finishProgress("电脑收件箱已收到 " + files.size() + " 个文件。", false); });
         });
     }
 
@@ -612,6 +614,46 @@ public final class MainActivity extends Activity {
         poll();
     }
 
+    private void showConnectionSettings() {
+        if (leaving || session == null) return;
+        new AlertDialog.Builder(this).setTitle("连接设置")
+                .setItems(new String[]{"更新电脑地址", "解除绑定"}, (dialog, item) -> {
+                    if (item == 0) updateAddress();
+                    else askLeave();
+                }).show();
+    }
+
+    private void updateAddress() {
+        TransferApi.Session current = session;
+        if (current == null || transferring) {
+            showHint("请等待当前文件传输完成。");
+            return;
+        }
+        EditText input = field("192.168.1.20:47331", false);
+        input.setText(current.route.origin.substring("http://".length()));
+        input.selectAll();
+        LinearLayout content = column();
+        content.setPadding(dp(22), dp(8), dp(22), 0);
+        add(content, label("填写电脑端显示的新地址，继续使用当前绑定。", 13, MUTED, false), 0);
+        add(content, input, 8);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("更新电脑地址").setView(content)
+                .setNegativeButton("取消", null).setPositiveButton("重连", null).create();
+        dialog.setOnShowListener(owner -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+            try {
+                current.route = new TransferApi.Route(TransferApi.addressOrigin(input.getText().toString()), null);
+                dialog.dismiss();
+                online = false;
+                showHint("");
+                renderStatus();
+                renderFiles();
+                poll();
+            } catch (IllegalArgumentException invalid) {
+                input.setError("请填写电脑上显示的局域网地址。");
+            }
+        }));
+        dialog.show();
+    }
+
     private void askLeave() {
         if (leaving) return;
         if (transferring) {
@@ -619,10 +661,10 @@ public final class MainActivity extends Activity {
             return;
         }
         new AlertDialog.Builder(this)
-                .setTitle("更换连接")
-                .setMessage("当前设备会断开，电脑上的中转文件将清空。请先下载要保留的文件。")
+                .setTitle("解除绑定")
+                .setMessage("解除后，下次使用时需要重新扫码。请先下载要保留的待收文件。")
                 .setNegativeButton("取消", null)
-                .setPositiveButton("断开", (dialog, button) -> {
+                .setPositiveButton("解除", (dialog, button) -> {
                     TransferApi.Session current = session;
                     if (current == null) return;
                     leaving = true;
@@ -633,7 +675,7 @@ public final class MainActivity extends Activity {
                         try {
                             TransferApi.leave(current);
                         } catch (Exception error) {
-                            notice = "请在原电脑端更换连接，结束原会话。";
+                            notice = "请在原电脑端也解除设备绑定。";
                         }
                         String finalNotice = notice;
                         updateUI(() -> {
@@ -651,14 +693,14 @@ public final class MainActivity extends Activity {
         transferring = false;
         filter = 0;
         hint = notice;
-        prefs.edit().remove("origin").remove("cookie").apply();
+        prefs.edit().remove("origin").remove("device-id").remove("device-key").remove("cookie").apply();
         showScreen();
     }
 
     private void showHelp() {
         new AlertDialog.Builder(this).setTitle("使用近传")
-                .setMessage("让手机和电脑连上同一个 Wi‑Fi。在手机上扫码，或填写电脑上显示的地址和配对码。\n\n"
-                        + "一端发送，另一端在传输记录中点“下载”。安卓会打开系统文件选择器，让你选择保存位置。\n\n"
+                .setMessage("让手机和电脑连上同一个 Wi‑Fi。首次使用时扫码或输入配对码，之后打开两端近传会自动重连。\n\n"
+                        + "手机发来的文件会自动进入电脑收件箱。收到电脑文件时，点“下载”选择手机上的保存位置。\n\n"
                         + "如果无法连接，请检查 Windows 防火墙设置。传输时请保持电脑端程序开启。")
                 .setPositiveButton("知道了", null).show();
     }
