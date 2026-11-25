@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f7fb">
+  <meta name="color-scheme" content="light">
+  <title>近传 · 手机电脑互传</title>
+  <link rel="icon" href="/assets/brand.png" type="image/png">
+  <link rel="stylesheet" href="/assets/app.css">
+  <script defer src="/assets/app.js"></script>
+</head>
+<body data-side="{{.}}">
+  {{$desktop := eq . "desktop"}}
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <div class="brand">
+        <img src="/assets/brand.png" width="36" height="36" alt="">
+        <span>近传</span>
+      </div>
+      <div class="topbar-tools">
+        <span class="network-pill" id="network" data-status="loading">
+          <span class="status-beacon" aria-hidden="true"></span><span id="network-label" role="status">正在连接</span>
+        </span>
+        {{if $desktop}}<button class="help-button install-button" id="open-installer" type="button" hidden><span class="icon i-phone" aria-hidden="true"></span>安装安卓端</button>{{end}}
+        <button class="help-button" id="open-help" type="button"><span class="icon i-help" aria-hidden="true"></span>帮助</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap main">
+    <header class="hero">
+      <h1>{{if $desktop}}手机电脑互传{{else}}与电脑互传{{end}}</h1>
+      <p>{{if $desktop}}连接同一个 Wi‑Fi，就能在手机和电脑之间收发文件。{{else}}选择要发送的文件，或在下方保存电脑发来的文件。{{end}}</p>
+    </header>
+    <div id="message" class="message" role="alert" hidden></div>
+
+    {{if not $desktop}}
+    <section class="card gate" id="gate" aria-live="polite">
+      <div class="gate-icon"><span class="icon i-scan" aria-hidden="true"></span></div>
+      <h2 id="gate-title">正在连接电脑</h2>
+      <p id="gate-text">请保持电脑上的近传程序开启。</p>
+      <button class="outline-button" id="retry-pair" type="button" hidden>重试连接</button>
+    </section>
+    {{end}}
+
+    <div id="workspace" {{if not $desktop}}hidden{{end}}>
+      <div class="workbench">
+        <section class="card send-card" aria-labelledby="send-title">
+          <div class="card-heading">
+            <h2 id="send-title">发送文件</h2>
+            <span class="route">
+              <span class="icon {{if $desktop}}i-monitor{{else}}i-phone{{end}}" aria-hidden="true"></span>
+              {{if $desktop}}电脑{{else}}手机{{end}}
+              <span class="icon i-arrow-right" aria-hidden="true"></span>
+              <span class="icon {{if $desktop}}i-phone{{else}}i-monitor{{end}}" aria-hidden="true"></span>
+              {{if $desktop}}手机{{else}}电脑{{end}}
+            </span>
+          </div>
+          <div id="dropzone" class="dropzone">
+            <div class="file-art" aria-hidden="true">
+              <span class="file-art-back"></span>
+              <span class="file-art-front"><span class="icon i-upload"></span></span>
+              <span class="spark spark-a"></span>
+              <span class="spark spark-b"></span>
+            </div>
+            <p class="drop-title">{{if $desktop}}把文件拖到这里{{else}}选择要发送的文件{{end}}</p>
+            <p class="drop-caption">{{if $desktop}}或从电脑选择，可以一次发送多个文件{{else}}支持照片、视频、文档，可多选{{end}}</p>
+            <button class="primary-button" id="pick-files" type="button" disabled>
+              <span class="icon i-plus" aria-hidden="true"></span>选择文件
+            </button>
+            <input id="file-picker" type="file" multiple hidden>
+          </div>
+          <ul id="queue" class="queue" aria-label="发送进度" hidden></ul>
+        </section>
+
+        {{if $desktop}}
+        <section class="pair-card" aria-labelledby="pair-heading">
+          <div class="pair-heading">
+            <div>
+              <h2 id="pair-heading">手机扫码连接</h2>
+              <p id="pair-subtitle">用近传 App 或手机相机扫描二维码</p>
+            </div>
+            <span class="scan-mark" aria-hidden="true"><span class="icon i-scan"></span></span>
+          </div>
+          <div class="pair-center">
+            <div id="unpaired" class="pair-panel">
+              <div class="qr-frame"><img id="qr" width="146" height="146" alt="手机配对二维码" hidden></div>
+            </div>
+            <div id="paired" class="pair-panel connected-panel" hidden>
+              <div class="connected-art" aria-hidden="true">
+                <span class="icon i-monitor"></span><span class="connected-dots"></span><span class="icon i-phone"></span>
+              </div>
+              <strong id="paired-label">手机已连接</strong>
+              <span id="paired-detail">现在可以双向收发文件</span>
+            </div>
+            <div id="no-lan" class="pair-panel connected-panel" hidden>
+              <div class="connected-art" aria-hidden="true"><span class="icon i-wifi"></span></div>
+              <strong>未找到可用的局域网地址</strong>
+              <span>连接 Wi‑Fi 后重新打开近传</span>
+            </div>
+          </div>
+          <div class="pair-actions">
+            <div class="pair-address">
+              <span class="icon i-wifi" aria-hidden="true"></span>
+              <span id="pair-address">正在查找地址</span>
+              <select id="network-choice" aria-label="局域网地址" hidden></select>
+              <span class="pair-code" id="manual-code" hidden>配对码 <strong id="code-digits"></strong></span>
+            </div>
+            <button class="pair-button" id="copy-link" type="button" disabled><span class="icon i-copy" aria-hidden="true"></span>复制链接</button>
+            <button class="pair-button" id="reset-pair" type="button" hidden><span class="icon i-refresh" aria-hidden="true"></span>更换连接</button>
+          </div>
+          <input class="manual-link" id="manual-link" aria-label="手机连接链接" type="text" readonly hidden>
+        </section>
+        {{end}}
+      </div>
+
+      <section class="card history" aria-labelledby="history-title">
+        <div class="history-heading">
+          <div class="history-title">
+            <span class="icon i-history" aria-hidden="true"></span>
+            <h2 id="history-title">传输记录</h2>
+          </div>
+          <div class="filters" role="group" aria-label="筛选传输记录">
+            <button type="button" data-filter="all" aria-pressed="true">全部</button>
+            <button type="button" data-filter="in" aria-pressed="false">收到</button>
+            <button type="button" data-filter="out" aria-pressed="false">发出</button>
+          </div>
+        </div>
+        <div id="empty" class="empty">
+          <div class="empty-icon" aria-hidden="true"><span class="icon i-inbox"></span></div>
+          <strong id="empty-title">还没有传输记录</strong>
+          <p id="empty-desc">收发的文件会出现在这里</p>
+        </div>
+        <ul id="file-list" class="file-list" aria-label="本次传输的文件" hidden></ul>
+        <div id="new-files" class="sr-only" role="status"></div>
+      </section>
+    </div>
+
+    <footer class="footer">
+      <span><span class="icon i-wifi" aria-hidden="true"></span>局域网直传</span>
+      <span>{{if $desktop}}传输时请保持近传程序开启{{else}}传输时请保持此页面开启{{end}}</span>
+    </footer>
+  </main>
+
+  <dialog id="help" class="dialog" aria-labelledby="help-title">
+    <form method="dialog" class="dialog-close">
+      <button class="icon-button" type="submit" aria-label="关闭帮助"><span class="icon i-close" aria-hidden="true"></span></button>
+    </form>
+    <h2 id="help-title">使用近传</h2>
+    <ol class="steps">
+      <li>让电脑和手机连上同一个 Wi‑Fi。</li>
+      <li>打开安卓端近传扫码，也可用手机相机扫码后在浏览器打开。</li>
+      <li>在任意一端选择文件，另一端在传输记录中点“下载”。</li>
+    </ol>
+    <p>搜不到电脑时，检查 Windows 防火墙是否允许近传接收连接。网络隔离也可能阻止两台设备互访。</p>
+    <p>关闭电脑上的近传程序会清理本次中转文件。请先下载需要保留的文件。</p>
+    {{if $desktop}}
+    <div class="dialog-actions">
+      <button class="outline-button" id="new-connection" type="button">生成新二维码</button>
+      <button class="outline-button" id="stop-service" type="button">结束传输</button>
+    </div>
+    {{end}}
+  </dialog>
+
+  {{if $desktop}}
+  <dialog id="installer" class="dialog" aria-labelledby="installer-title">
+    <form method="dialog" class="dialog-close">
+      <button class="icon-button" type="submit" aria-label="关闭安卓端安装窗口"><span class="icon i-close" aria-hidden="true"></span></button>
+    </form>
+    <h2 id="installer-title">安装安卓端</h2>
+    <p id="installer-tip">用手机相机扫码下载。安装后打开近传，再扫描工作台上的配对二维码。</p>
+    <div class="installer-qr" id="installer-qr" hidden>
+      <img id="installer-image" width="166" height="166" alt="安卓安装包下载二维码">
+    </div>
+    <div class="dialog-actions">
+      <a class="outline-button" href="/android" download>下载 APK</a>
+    </div>
+  </dialog>
+  <dialog id="confirm" class="dialog" aria-labelledby="confirm-title">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-text"></p>
+    <div class="dialog-actions">
+      <form method="dialog"><button class="outline-button" type="submit" autofocus>取消</button></form>
+      <button class="primary-button" id="confirm-action" type="button">确认</button>
+    </div>
+  </dialog>
+  {{end}}
+
+  <div class="toast" id="toast" role="status" hidden></div>
+</body>
+</html>

@@ -1,0 +1,26 @@
+# Build outputs
+*.apk
+*.aab
+*.exe
+*.jar
+*.syso
+*.zip
+/build/
+/dist/
+__pycache__/
+*.pyc
+
+# Local signing credentials and machine state
+*.p12
+*.jks
+*.keystore
+*.key
+*.pem
+/password.txt
+**/password.txt
+.env
+.env.*
+binding.dat
+widget.json
+local.properties
+*.log
