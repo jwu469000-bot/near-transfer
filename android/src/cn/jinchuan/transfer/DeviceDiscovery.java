@@ -115,7 +115,7 @@ final class DeviceDiscovery {
         return encoded(buffer);
     }
 
-    private static String encoded(byte[] bytes) {
+    static String encoded(byte[] bytes) {
         char[] value = new char[bytes.length * 2];
         for (int i = 0; i < bytes.length; i++) {
             int part = bytes[i] & 255;

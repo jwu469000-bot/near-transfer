@@ -99,8 +99,8 @@ func run(port int, noOpen bool, dataDir, inbox string) error {
 	defer os.RemoveAll(h.tempDir)
 
 	h.endpoints = lanEndpoints(port)
-	desktop := h.handler(true)
-	phone := h.handler(false)
+	desktop := h.handler(desktopAccess)
+	phone := h.handler(lanAccess)
 	server := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			addr, _ := r.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr)
@@ -127,6 +127,7 @@ func run(port int, noOpen bool, dataDir, inbox string) error {
 		}
 	}()
 	go h.watchNetwork(port)
+	remoteDone := h.startTailscale()
 	stopDiscovery := h.startDiscovery()
 	defer stopDiscovery()
 	go func() {
@@ -145,6 +146,7 @@ func run(port int, noOpen bool, dataDir, inbox string) error {
 	}
 	h.beginShutdown()
 	server.Close()
+	<-remoteDone
 	h.fileOperations.Wait()
 	select {
 	case serveErr := <-serveErrors:

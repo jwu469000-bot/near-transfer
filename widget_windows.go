@@ -219,7 +219,7 @@ func (h *hub) widgetStatus() (widgetState, bool) {
 		}
 	}
 	return widgetState{
-		paired: h.paired(), bound: h.bound.ID != "", network: len(h.endpoints) != 0,
+		paired: h.paired(), bound: h.bound.ID != "", network: len(h.endpoints) != 0 || h.remoteAddress != "",
 		online: current.phoneTransfers > 0 || time.Since(current.phoneSeen) < 14*time.Second,
 		room:   current.number, received: current.received, receivedTexts: current.receivedTexts,
 		request: request,

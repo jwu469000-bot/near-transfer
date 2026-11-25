@@ -37,7 +37,7 @@ var webFiles embed.FS
 var indexPage = template.Must(template.ParseFS(webFiles, "web/index.html"))
 var installerAPK, _ = webFiles.ReadFile("web/install/near-transfer-android.apk")
 
-const androidVersion = "1.2.0"
+const androidVersion = "1.3.0"
 const installerName = "NearTransfer-Android-" + androidVersion + ".apk"
 const transferCanceled = "传输已取消。"
 
@@ -96,6 +96,8 @@ type hub struct {
 	desktopKey     string
 	port           string
 	endpoints      []endpoint
+	remoteAddress  string
+	remoteFailed   bool
 	stopping       bool
 	stop           chan struct{}
 	fileOperations sync.WaitGroup
@@ -148,38 +150,50 @@ func randomKey() string {
 	return hex.EncodeToString(key)
 }
 
-func (h *hub) handler(desktop bool) http.Handler {
-	assets, _ := fs.Sub(webFiles, "web")
-	static := http.FileServer(http.FS(assets))
+type accessMode int
+
+const (
+	desktopAccess accessMode = iota
+	lanAccess
+	remoteAccess
+)
+
+func (h *hub) handler(mode accessMode) http.Handler {
+	desktop := mode == desktopAccess
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
-		side := "phone"
-		if desktop {
-			side = "desktop"
-			h.setCookie(w, true, h.desktopKey)
+	if mode != remoteAccess {
+		assets, _ := fs.Sub(webFiles, "web")
+		mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+			side := "phone"
+			if desktop {
+				side = "desktop"
+				h.setCookie(w, true, h.desktopKey)
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			indexPage.Execute(w, side)
+		})
+		mux.Handle("GET /assets/", http.FileServer(http.FS(assets)))
+		if len(installerAPK) > 0 {
+			mux.HandleFunc("GET /android", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/vnd.android.package-archive")
+				w.Header().Set("Content-Disposition", "attachment; filename="+installerName)
+				http.ServeContent(w, r, installerName, time.Time{}, bytes.NewReader(installerAPK))
+			})
 		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		indexPage.Execute(w, side)
-	})
-	mux.Handle("GET /assets/", static)
+	}
 	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) { h.state(w, r, desktop) })
 	mux.HandleFunc("POST /api/upload", func(w http.ResponseWriter, r *http.Request) { h.upload(w, r, desktop) })
 	mux.HandleFunc("GET /api/files/{id}", func(w http.ResponseWriter, r *http.Request) { h.download(w, r, desktop) })
 	mux.HandleFunc("POST /api/text", func(w http.ResponseWriter, r *http.Request) { h.postText(w, r, desktop) })
 	mux.HandleFunc("GET /api/text/{id}", func(w http.ResponseWriter, r *http.Request) { h.getText(w, r, desktop) })
-	if len(installerAPK) > 0 {
-		mux.HandleFunc("GET /android", func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/vnd.android.package-archive")
-			w.Header().Set("Content-Disposition", "attachment; filename="+installerName)
-			http.ServeContent(w, r, installerName, time.Time{}, bytes.NewReader(installerAPK))
-		})
-	}
 	if desktop {
 		mux.HandleFunc("GET /api/qr", h.qr)
 		mux.HandleFunc("POST /api/reset", func(w http.ResponseWriter, r *http.Request) { h.reset(w, r, true) })
 		mux.HandleFunc("POST /api/stop", h.requestStop)
 	} else {
-		mux.HandleFunc("POST /api/pair", h.pair)
+		if mode == lanAccess {
+			mux.HandleFunc("POST /api/pair", h.pair)
+		}
 		mux.HandleFunc("GET /api/identity", h.identity)
 		mux.HandleFunc("POST /api/leave", func(w http.ResponseWriter, r *http.Request) { h.reset(w, r, false) })
 	}
@@ -190,20 +204,41 @@ func (h *hub) handler(desktop bool) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
 
-		local, _ := r.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr)
-		remote, _, _ := net.SplitHostPort(r.RemoteAddr)
-		peer := net.ParseIP(remote)
-		if local == nil || r.Host != local.String() ||
-			(desktop && !peer.IsLoopback()) || (!desktop && !h.reachable(r.Host, peer)) {
-			apiError(w, http.StatusForbidden, "请从同一网络访问此地址。")
+		if !h.acceptsRequest(r, mode) {
+			apiError(w, http.StatusForbidden, "请从近传支持的网络访问此地址。")
 			return
 		}
-		if r.Method == "POST" && r.Header.Get("Origin") != "http://"+r.Host {
+		if r.Method == "POST" && r.Header.Get("Origin") != requestOrigin(r) {
 			apiError(w, http.StatusForbidden, "请从近传页面发起操作。")
 			return
 		}
 		mux.ServeHTTP(w, r)
 	})
+}
+
+func (h *hub) acceptsRequest(r *http.Request, mode accessMode) bool {
+	local, _ := r.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr)
+	if local == nil || r.Host != local.String() {
+		return false
+	}
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	peer := net.ParseIP(host)
+	switch mode {
+	case desktopAccess:
+		return peer.IsLoopback()
+	case lanAccess:
+		return h.reachable(r.Host, peer)
+	case remoteAccess:
+		return r.TLS != nil && carrierSubnet.Contains(local.IP) && carrierSubnet.Contains(peer)
+	}
+	return false
+}
+
+func requestOrigin(r *http.Request) string {
+	if r.TLS != nil {
+		return "https://" + r.Host
+	}
+	return "http://" + r.Host
 }
 
 func (h *hub) reachable(local string, peer net.IP) bool {
@@ -239,8 +274,10 @@ func (h *hub) authorized(r *http.Request, desktop bool) bool {
 	if desktop {
 		key = h.desktopKey
 	} else if h.bound.ID != "" {
-		ticket := "Bearer " + signature(h.bound.Key, "ticket", "http://"+r.Host, h.epoch)
+		ticket := "Bearer " + signature(h.bound.Key, "ticket", requestOrigin(r), h.epoch)
 		return subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte(ticket)) == 1
+	} else if r.TLS != nil {
+		return false
 	}
 	cookie, err := r.Cookie(h.cookieName(desktop))
 	return err == nil && key != "" && subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(key)) == 1

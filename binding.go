@@ -117,7 +117,7 @@ func (h *hub) identity(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
 		"epoch": epoch,
-		"proof": signature(device.Key, "host", "http://"+r.Host, nonce, epoch),
+		"proof": signature(device.Key, "host", requestOrigin(r), nonce, epoch),
 	})
 }
 

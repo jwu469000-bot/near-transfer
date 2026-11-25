@@ -18,13 +18,15 @@ const setupWidth, setupHeight = 468, 340
 const (
 	pairTab = iota
 	installTab
+	remoteTab
 	setupPrimary
 	setupNetwork
 )
 
 var setupButtons = [...]winRect{
-	{20, 16, 233, 49},
-	{235, 16, 448, 49},
+	{20, 16, 161, 49},
+	{164, 16, 305, 49},
+	{308, 16, 448, 49},
 	{221, 263, 328, 299},
 	{339, 263, 448, 299},
 }
@@ -33,6 +35,7 @@ type setupState struct {
 	address, code, payload string
 	choices                int
 	paired, online         bool
+	bound, remoteFailed    bool
 }
 
 type setupPanel struct {
@@ -130,6 +133,11 @@ func (p *setupPanel) snapshot() setupState {
 		paired: h.paired(), choices: len(h.endpoints),
 		online: current.phoneTransfers > 0 || time.Since(current.phoneSeen) < 14*time.Second,
 	}
+	if p.tab == remoteTab {
+		state.address = h.remoteAddress
+		state.bound, state.remoteFailed, state.choices = h.bound.ID != "", h.remoteFailed, 0
+		return state
+	}
 	if state.choices == 0 {
 		return state
 	}
@@ -172,7 +180,7 @@ func (p *setupPanel) redraw() { invalidateWindow.Call(p.hwnd, 0, 0) }
 
 func (p *setupPanel) enabled(action int) bool {
 	switch action {
-	case pairTab, installTab:
+	case pairTab, installTab, remoteTab:
 		return true
 	case setupPrimary:
 		if p.tab == installTab {
@@ -200,7 +208,7 @@ func (p *setupPanel) target(x, y int32) int {
 
 func (p *setupPanel) choose(action int) {
 	switch action {
-	case pairTab, installTab:
+	case pairTab, installTab, remoteTab:
 		p.tab = action
 		p.notice = ""
 		p.refresh()

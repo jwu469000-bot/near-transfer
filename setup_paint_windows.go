@@ -12,7 +12,7 @@ func (p *setupPanel) paint(dc uintptr) {
 	c := painter{dc, p.dpi}
 	c.fill(winRect{0, 0, setupWidth, setupHeight}, 0xf7f8fc)
 	c.round(17, 13, 451, 52, 12, 0xedeff7, 0xedeff7)
-	for tab, text := range []string{"设备配对", "安装安卓端"} {
+	for tab, text := range []string{"设备配对", "安装安卓端", "异地连接"} {
 		area := setupButtons[tab]
 		border := uint32(cardLine)
 		if p.focus == tab {
@@ -27,12 +27,16 @@ func (p *setupPanel) paint(dc uintptr) {
 		}
 		c.drawText(text, area, 13, color, true, 1)
 	}
+	if p.tab == remoteTab {
+		p.paintRemote(c)
+		return
+	}
 
 	title, detail := "绑定这台安卓手机", "在安卓近传里点「打开相机」，扫描配对二维码。"
 	if p.tab == installTab {
 		title, detail = "安装安卓近传", "用手机相机扫码下载，也可以把 APK 保存到电脑。"
 	} else if p.state.paired {
-		title, detail = "已绑定这台手机", "以后在同一个 Wi‑Fi 下打开两端近传即可自动连接。"
+		title, detail = "已绑定这台手机", "以后在同一局域网打开两端近传即可自动连接。"
 	}
 	c.label(title, 20, 65, 448, 99, 22, cardInk, true)
 	c.label(detail, 20, 100, 448, 123, 12, cardMuted, false)
@@ -87,6 +91,37 @@ func (p *setupPanel) paint(dc uintptr) {
 	}
 	if p.enabled(setupNetwork) {
 		p.button(c, setupNetwork, "切换地址", false)
+	}
+	if p.notice != "" {
+		c.label(p.notice, 20, 315, 448, 337, 11, 0x16775f, false)
+	}
+}
+
+func (p *setupPanel) paintRemote(c painter) {
+	c.label("在外面连接这台电脑", 20, 65, 448, 99, 22, cardInk, true)
+	c.label("让电脑和手机连接到同一个 Tailscale 私有网络。", 20, 100, 448, 123, 12, cardMuted, false)
+
+	c.round(20, 133, 448, 245, 14, cardWhite, cardLine)
+	c.label("电脑的异地地址", 34, 145, 432, 171, 14, cardInk, true)
+	address := p.state.address
+	color := uint32(indigo)
+	if address == "" {
+		color = cardMuted
+		switch {
+		case !p.state.bound:
+			address = "先在「设备配对」页绑定安卓手机"
+		case p.state.remoteFailed:
+			address = "无法启用异地连接，请检查 TCP 47332 端口"
+		default:
+			address = "电脑连接 Tailscale 后自动显示"
+		}
+	}
+	c.label(address, 34, 176, 432, 204, 15, color, true)
+	c.label("在手机近传的「连接设置 → 异地连接」里填入这个地址。", 34, 209, 432, 235, 12, cardMuted, false)
+
+	c.label("异地使用时，电脑需要保持唤醒。", 20, 263, 216, 299, 12, cardMuted, false)
+	if p.enabled(setupPrimary) {
+		p.button(c, setupPrimary, "复制地址", false)
 	}
 	if p.notice != "" {
 		c.label(p.notice, 20, 315, 448, 337, 11, 0x16775f, false)

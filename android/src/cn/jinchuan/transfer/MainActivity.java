@@ -87,6 +87,7 @@ public final class MainActivity extends Activity {
     private String hint = "";
     private String addressDraft = "";
     private TextView status;
+    private TextView transport;
     private TextView message;
     private LinearLayout progressPanel;
     private TextView progressText;
@@ -121,7 +122,7 @@ public final class MainActivity extends Activity {
         super.onCreate(saved);
         prefs = getSharedPreferences("near-transfer", MODE_PRIVATE);
         session = TransferApi.restore(prefs.getString("origin", null), prefs.getString("device-id", null),
-                prefs.getString("device-key", null));
+                prefs.getString("device-key", null), prefs.getString("remote-origin", ""));
         addressDraft = prefs.getString("last-address", "");
         if (session != null && saved != null) {
             String cached = saved.getString("download-file", "");
@@ -218,7 +219,7 @@ public final class MainActivity extends Activity {
 
         TextView title = label("与电脑互传", 32, INK, true);
         add(page, title, 15);
-        String description = session == null ? "和电脑连上同一个 Wi‑Fi，即可收发文件。" : "选择要发送的文件，或保存电脑发来的文件。";
+        String description = session == null ? "在同一局域网和电脑完成配对。" : "选择要发送的文件，或保存电脑发来的文件。";
         add(page, label(description, 14, MUTED, false), 5);
         message = label(hint, 13, 0xff80501f, false);
         message.setPadding(dp(11), dp(9), dp(11), dp(9));
@@ -238,9 +239,9 @@ public final class MainActivity extends Activity {
         ImageView wifi = image(R.drawable.near_wifi);
         wifi.setColorFilter(MUTED);
         footer.addView(wifi, new LinearLayout.LayoutParams(dp(16), dp(16)));
-        TextView text = label("局域网直传", 12, MUTED, false);
-        text.setPadding(dp(5), 0, 0, 0);
-        footer.addView(text, new LinearLayout.LayoutParams(0, -2, 1));
+        transport = label("局域网直传", 12, MUTED, false);
+        transport.setPadding(dp(5), 0, 0, 0);
+        footer.addView(transport, new LinearLayout.LayoutParams(0, -2, 1));
         if (session != null) {
             Button settings = button("连接设置", MUTED, Color.TRANSPARENT, false);
             settings.setOnClickListener(v -> showConnectionSettings());
@@ -401,7 +402,7 @@ public final class MainActivity extends Activity {
                 updateUI(() -> {
                     pairing = false;
                     renderStatus();
-                    showHint(transferMessage(error, "无法连接电脑。请确认两台设备在同一个 Wi‑Fi，并检查电脑端是否允许连接。"));
+                    showHint(transferMessage(error, "无法连接电脑。请确认两台设备在同一局域网，并检查电脑端是否允许连接。"));
                 });
             }
         });
@@ -420,7 +421,7 @@ public final class MainActivity extends Activity {
                     boolean recovered = !online;
                     state = next;
                     online = true;
-                    String origin = current.route.origin;
+                    String origin = current.lanOrigin;
                     if (!origin.equals(prefs.getString("origin", ""))) {
                         addressDraft = origin.substring("http://".length());
                         prefs.edit().putString("origin", origin).putString("last-address", addressDraft).apply();
@@ -435,7 +436,9 @@ public final class MainActivity extends Activity {
                     polling = false;
                     if (session != current) return;
                     online = false;
-                    showHint("电脑暂时离线。两端打开近传并连接同一 Wi‑Fi 后会自动重连。");
+                    showHint(current.remoteOrigin.isEmpty()
+                            ? "电脑暂时离线。在同一局域网打开两端近传后会自动重连。"
+                            : "电脑暂时离线。异地使用时，请确认电脑已唤醒，且两端 Tailscale 已连接。");
                     renderStatus();
                     renderFiles();
                     if (textDialog != null) textDialog.refresh();
@@ -452,7 +455,9 @@ public final class MainActivity extends Activity {
             scan.setEnabled(!pairing);
             connect.setEnabled(!pairing);
         } else {
-            status.setText(online ? "已连接电脑" : "自动重连中");
+            String connected = session.route.remote() ? "已异地连接" : "已连接电脑";
+            status.setText(online ? connected : "自动重连中");
+            transport.setText(session.route.remote() ? "Tailscale 加密连接" : "局域网直传");
             status.setTextColor(online ? GREEN : 0xff8a5b29);
             status.setBackground(surface(online ? MINT : 0xffffedd7, Color.TRANSPARENT, 99));
             chooseFiles.setEnabled(online && fileTransfer == null && !leaving);
@@ -959,30 +964,43 @@ public final class MainActivity extends Activity {
     private void showConnectionSettings() {
         if (leaving || session == null) return;
         new AlertDialog.Builder(this).setTitle("连接设置")
-                .setItems(new String[]{"更新电脑地址", "解除绑定"}, (dialog, item) -> {
-                    if (item == 0) updateAddress();
+                .setItems(new String[]{"更新电脑地址", "异地连接", "解除绑定"}, (dialog, item) -> {
+                    if (item == 0) updateAddress(false);
+                    else if (item == 1) updateAddress(true);
                     else askLeave();
                 }).show();
     }
 
-    private void updateAddress() {
+    private void updateAddress(boolean remote) {
         TransferApi.Session current = session;
         if (current == null || fileTransfer != null) {
             showHint("请等待当前文件传输完成。");
             return;
         }
-        EditText input = field("192.168.1.20:47331", false);
-        input.setText(current.route.origin.substring("http://".length()));
+        EditText input = field(remote ? "100.x.x.x:47332" : "192.168.1.20:47331", false);
+        String origin = remote ? current.remoteOrigin : current.lanOrigin;
+        if (!origin.isEmpty()) input.setText(origin.substring(origin.indexOf("://") + 3));
         input.selectAll();
         LinearLayout content = column();
         content.setPadding(dp(22), dp(8), dp(22), 0);
-        add(content, label("填写电脑端显示的新地址，继续使用当前绑定。", 13, MUTED, false), 0);
+        String help = remote
+                ? "两端连接同一个 Tailscale 私有网络，填写电脑端「异地连接」页的地址。留空可关闭异地连接。"
+                : "填写电脑端显示的局域网地址，继续使用当前绑定。";
+        add(content, label(help, 13, MUTED, false), 0);
         add(content, input, 8);
-        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("更新电脑地址").setView(content)
-                .setNegativeButton("取消", null).setPositiveButton("重连", null).create();
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle(remote ? "异地连接" : "更新电脑地址")
+                .setView(content).setNegativeButton("取消", null)
+                .setPositiveButton(remote ? "保存" : "重连", null).create();
         dialog.setOnShowListener(owner -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
             try {
-                current.route = new TransferApi.Route(TransferApi.addressOrigin(input.getText().toString()), null);
+                String entered = input.getText().toString().trim();
+                if (remote) {
+                    String address = entered.isEmpty() ? "" : TransferApi.remoteOrigin(entered);
+                    current.setRemoteOrigin(address);
+                    prefs.edit().putString("remote-origin", address).apply();
+                } else {
+                    current.setLanOrigin(TransferApi.addressOrigin(entered));
+                }
                 dialog.dismiss();
                 online = false;
                 showHint("");
@@ -990,7 +1008,7 @@ public final class MainActivity extends Activity {
                 renderFiles();
                 poll();
             } catch (IllegalArgumentException invalid) {
-                input.setError("请填写电脑上显示的局域网地址。");
+                input.setError(remote ? "请填写电脑端显示的 Tailscale 异地地址。" : "请填写电脑上显示的局域网地址。");
             }
         }));
         dialog.show();
@@ -1038,13 +1056,13 @@ public final class MainActivity extends Activity {
         fileTransfer = null;
         filter = 0;
         hint = notice;
-        prefs.edit().remove("origin").remove("device-id").remove("device-key").remove("cookie").apply();
+        prefs.edit().remove("origin").remove("remote-origin").remove("device-id").remove("device-key").remove("cookie").apply();
         showScreen();
     }
 
     private void showHelp() {
         new AlertDialog.Builder(this).setTitle("使用近传")
-                .setMessage("让手机和电脑连上同一个 Wi‑Fi。首次使用时扫码或输入配对码，之后打开两端近传会自动重连。\n\n"
+                .setMessage("在同一局域网内扫码或输入配对码，之后打开两端近传会自动重连。异地使用前，在「连接设置 → 异地连接」中填写电脑的 Tailscale 地址。\n\n"
                         + "手机发来的文件会自动进入电脑收件箱。点“下载”接收电脑发来的文件，下载完成后选择保存位置。"
                         + "收发过程中可点进度条旁的“取消”。\n\n"
                         + "如果无法连接，请检查 Windows 防火墙设置。传输时请保持电脑端程序开启。")

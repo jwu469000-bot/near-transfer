@@ -19,8 +19,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLSocketFactory;
+
 final class TransferApi {
     static final int TEXT_LIMIT = 256 * 1024;
+    private static final int REMOTE_PORT = 47332;
     interface Progress {
         void update(long done, long total);
     }
@@ -39,11 +43,35 @@ final class TransferApi {
         final String id;
         final String key;
         volatile Route route;
+        volatile String lanOrigin;
+        volatile String remoteOrigin = "";
+        private SSLSocketFactory remoteSockets;
 
         Session(String origin, String id, String key) {
             this.id = id;
             this.key = key;
+            setLanOrigin(origin);
+        }
+
+        synchronized void setLanOrigin(String origin) {
+            lanOrigin = origin;
             route = new Route(origin, null);
+        }
+
+        synchronized void setRemoteOrigin(String origin) {
+            remoteOrigin = origin;
+            route = new Route(origin.isEmpty() ? lanOrigin : origin, null);
+        }
+
+        synchronized void acceptRoute(Route expected, Route found) {
+            if (route != expected) return;
+            if (!found.remote()) lanOrigin = found.origin;
+            route = found;
+        }
+
+        synchronized SSLSocketFactory remoteSockets() throws IOException {
+            if (remoteSockets == null) remoteSockets = RemoteTls.forBinding(key);
+            return remoteSockets;
         }
     }
 
@@ -55,6 +83,8 @@ final class TransferApi {
             this.origin = origin;
             this.ticket = ticket;
         }
+
+        boolean remote() { return origin.startsWith("https://"); }
     }
 
     static final class Record {
@@ -146,14 +176,36 @@ final class TransferApi {
         return localOrigin(uri);
     }
 
-    static Session restore(String origin, String id, String key) {
+    static String remoteOrigin(String address) {
+        String entered = address.trim();
+        URI uri = URI.create(entered.startsWith("https://") ? entered : "https://" + entered);
+        String host = uri.getHost();
+        int port = uri.getPort();
+        String path = uri.getRawPath();
+        if (!"https".equals(uri.getScheme()) || !isLanIPv4(host) || !host.startsWith("100.")
+                || uri.getUserInfo() != null || uri.getRawQuery() != null || uri.getRawFragment() != null
+                || (path != null && !path.isEmpty() && !"/".equals(path)) || port == 0 || port > 65535) {
+            throw new IllegalArgumentException("请输入电脑端显示的 Tailscale 异地地址。");
+        }
+        return "https://" + host + ":" + (port == -1 ? REMOTE_PORT : port);
+    }
+
+    static Session restore(String origin, String id, String key, String remote) {
         if (origin == null || !DeviceDiscovery.hex(id, 48) || !DeviceDiscovery.hex(key, 48)) return null;
         try {
-            if (origin.equals(localOrigin(URI.create(origin)))) return new Session(origin, id, key);
+            if (!origin.equals(localOrigin(URI.create(origin)))) return null;
         } catch (IllegalArgumentException ignored) {
-            // A saved address can be invalid after an upgrade.
+            return null;
         }
-        return null;
+        Session session = new Session(origin, id, key);
+        if (remote != null && !remote.isEmpty()) {
+            try {
+                session.setRemoteOrigin(remoteOrigin(remote));
+            } catch (IllegalArgumentException ignored) {
+                // The saved LAN binding is still usable when the remote address is invalid.
+            }
+        }
+        return session;
     }
 
     private static String localOrigin(URI uri) {
@@ -183,7 +235,7 @@ final class TransferApi {
 
     static Session pair(Target target) throws IOException, JSONException {
         Session session = new Session(target.origin, DeviceDiscovery.randomHex(24), DeviceDiscovery.randomHex(24));
-        HttpURLConnection request = open(target.origin, "/api/pair", "POST", null);
+        HttpURLConnection request = open(null, target.origin, "/api/pair", "POST", null);
         try {
             byte[] body = new JSONObject().put("code", target.code).put("mode", "android")
                     .put("id", session.id).put("key", session.key).toString().getBytes(StandardCharsets.UTF_8);
@@ -217,21 +269,21 @@ final class TransferApi {
         Route cached = session.route;
         if (cached.ticket != null) {
             try {
-                return readState(cached);
+                return readState(session, cached);
             } catch (IOException | JSONException unavailable) {
                 // A desktop restart rotates its ticket. Probe the remembered address first.
             }
         }
         Route found = findRoute(session, cached);
-        State state = readState(found);
-        if (session.route == cached) session.route = found;
+        State state = readState(session, found);
+        session.acceptRoute(cached, found);
         return state;
     }
 
-    private static State readState(Route route) throws IOException, JSONException {
-        HttpURLConnection request = open(route.origin, "/api/state", "GET", route.ticket);
-        request.setConnectTimeout(1500);
-        request.setReadTimeout(2500);
+    private static State readState(Session session, Route route) throws IOException, JSONException {
+        HttpURLConnection request = open(session, route.origin, "/api/state", "GET", route.ticket);
+        request.setConnectTimeout(route.remote() ? 3000 : 1500);
+        request.setReadTimeout(route.remote() ? 5000 : 2500);
         try {
             requireSuccess(request);
             try (InputStream input = request.getInputStream()) {
@@ -246,15 +298,25 @@ final class TransferApi {
         try {
             return probe(session, cached.origin);
         } catch (IOException | JSONException unavailable) {
-            return DeviceDiscovery.find(session, cached.origin);
+            String lan = session.lanOrigin;
+            String alternate = cached.remote() ? lan : session.remoteOrigin;
+            if (!alternate.isEmpty() && !alternate.equals(cached.origin)) {
+                try {
+                    return probe(session, alternate);
+                } catch (IOException | JSONException unreachable) {
+                    // The last LAN address can be stale. Discover the paired computer again.
+                }
+            }
+            return DeviceDiscovery.find(session, lan);
         }
     }
 
     private static Route probe(Session session, String origin) throws IOException, JSONException {
         String nonce = DeviceDiscovery.randomHex(16);
-        HttpURLConnection request = open(origin, "/api/identity?id=" + session.id + "&nonce=" + nonce, "GET", null);
-        request.setConnectTimeout(950);
-        request.setReadTimeout(950);
+        HttpURLConnection request = open(session, origin, "/api/identity?id=" + session.id + "&nonce=" + nonce, "GET", null);
+        int timeout = origin.startsWith("https://") ? 3500 : 950;
+        request.setConnectTimeout(timeout);
+        request.setReadTimeout(timeout);
         try {
             requireSuccess(request);
             try (InputStream in = request.getInputStream()) {
@@ -274,15 +336,15 @@ final class TransferApi {
         Route route = session.route;
         if (route.ticket == null) route = findRoute(session, route);
         try {
-            postLeave(route);
+            postLeave(session, route);
         } catch (HttpError error) {
             if (error.status != 401) throw error;
-            postLeave(findRoute(session, route));
+            postLeave(session, findRoute(session, route));
         }
     }
 
-    private static void postLeave(Route route) throws IOException {
-        HttpURLConnection request = open(route.origin, "/api/leave", "POST", route.ticket);
+    private static void postLeave(Session session, Route route) throws IOException {
+        HttpURLConnection request = open(session, route.origin, "/api/leave", "POST", route.ticket);
         try {
             request.setConnectTimeout(1800);
             request.setReadTimeout(2500);
@@ -294,7 +356,7 @@ final class TransferApi {
 
     static void send(Session session, int room, FileAccess.Source source, FileTransfer transfer, Progress progress) throws IOException {
         Route route = session.route;
-        HttpURLConnection request = open(route.origin, "/api/upload", "POST", route.ticket);
+        HttpURLConnection request = open(session, route.origin, "/api/upload", "POST", route.ticket);
         transfer.attach(request);
         try {
             request.setDoOutput(true);
@@ -320,7 +382,7 @@ final class TransferApi {
     static void receive(Session session, Record record, OutputStream out, FileTransfer transfer, Progress progress) throws IOException {
         if (!record.id.matches("[dp][a-f0-9]{32}")) throw new IOException("文件记录无效。");
         Route route = session.route;
-        HttpURLConnection request = open(route.origin, "/api/files/" + record.id, "GET", route.ticket);
+        HttpURLConnection request = open(session, route.origin, "/api/files/" + record.id, "GET", route.ticket);
         transfer.attach(request);
         try {
             request.setRequestProperty("Connection", "close");
@@ -339,7 +401,7 @@ final class TransferApi {
         byte[] body = value.getBytes(StandardCharsets.UTF_8);
         if (body.length > TEXT_LIMIT) throw new HttpError(413, "单条文字最多 256 KB。");
         Route route = session.route;
-        HttpURLConnection request = open(route.origin, "/api/text", "POST", route.ticket);
+        HttpURLConnection request = open(session, route.origin, "/api/text", "POST", route.ticket);
         try {
             request.setConnectTimeout(2200);
             request.setReadTimeout(5500);
@@ -360,7 +422,7 @@ final class TransferApi {
     static String getText(Session session, TextRecord record) throws IOException {
         if (!record.id.matches("[dp][a-f0-9]{32}")) throw new IOException("文字记录无效。");
         Route route = session.route;
-        HttpURLConnection request = open(route.origin, "/api/text/" + record.id, "GET", route.ticket);
+        HttpURLConnection request = open(session, route.origin, "/api/text/" + record.id, "GET", route.ticket);
         try {
             request.setConnectTimeout(2200);
             request.setReadTimeout(5500);
@@ -373,8 +435,12 @@ final class TransferApi {
         }
     }
 
-    private static HttpURLConnection open(String origin, String path, String method, String ticket) throws IOException {
+    private static HttpURLConnection open(Session session, String origin, String path, String method, String ticket) throws IOException {
         HttpURLConnection request = (HttpURLConnection) new URL(origin + path).openConnection(Proxy.NO_PROXY);
+        if (request instanceof HttpsURLConnection) {
+            if (session == null) throw new IOException("异地连接需要设备配对。");
+            ((HttpsURLConnection) request).setSSLSocketFactory(session.remoteSockets());
+        }
         request.setConnectTimeout(5500);
         request.setReadTimeout(20000);
         request.setInstanceFollowRedirects(false);
