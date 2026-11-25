@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"embed"
@@ -20,6 +21,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,8 +37,9 @@ var webFiles embed.FS
 var indexPage = template.Must(template.ParseFS(webFiles, "web/index.html"))
 var installerAPK, _ = webFiles.ReadFile("web/install/near-transfer-android.apk")
 
-const androidVersion = "1.1.1"
+const androidVersion = "1.2.0"
 const installerName = "NearTransfer-Android-" + androidVersion + ".apk"
+const transferCanceled = "传输已取消。"
 
 type transfer struct {
 	ID        string    `json:"id"`
@@ -64,8 +67,22 @@ type room struct {
 	receivedTexts  int
 	byID           map[string]*transfer
 	uploading      map[string]bool
+	fileRequests   []*fileRequest
 	active         int
 	retired        bool
+}
+
+type fileRequest struct {
+	ctx         context.Context
+	cancel      context.CancelFunc
+	setDeadline func(time.Time) error
+	caption     string
+	committed   bool // guarded by hub.mu
+}
+
+func newFileRequest(parent context.Context, caption string, setDeadline func(time.Time) error) *fileRequest {
+	ctx, cancel := context.WithCancel(parent)
+	return &fileRequest{ctx: ctx, cancel: cancel, setDeadline: setDeadline, caption: caption}
 }
 
 type hub struct {
@@ -451,19 +468,26 @@ func (h *hub) beginShutdown() {
 }
 
 // startFileOperation is called with mu held before opening a staged file.
-func (h *hub) startFileOperation(current *room, desktop bool) {
+func (h *hub) startFileOperation(current *room, desktop bool, request *fileRequest) {
 	h.fileOperations.Add(1)
 	current.active++
+	if request != nil {
+		current.fileRequests = append(current.fileRequests, request)
+	}
 	if !desktop {
 		current.phoneTransfers++
 		current.phoneSeen = time.Now()
 	}
 }
 
-func (h *hub) finishFileOperation(current *room, desktop bool) {
+func (h *hub) finishFileOperation(current *room, desktop bool, request *fileRequest) {
 	defer h.fileOperations.Done()
 	h.mu.Lock()
 	current.active--
+	if request != nil {
+		at := slices.Index(current.fileRequests, request)
+		current.fileRequests = slices.Delete(current.fileRequests, at, at+1)
+	}
 	if !desktop {
 		current.phoneTransfers--
 		current.phoneSeen = time.Now()
@@ -473,6 +497,18 @@ func (h *hub) finishFileOperation(current *room, desktop bool) {
 	if remove {
 		os.RemoveAll(current.dir)
 	}
+}
+
+func (h *hub) cancelFileRequest(request *fileRequest) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if request.committed || request.ctx.Err() != nil || !slices.Contains(h.room.fileRequests, request) {
+		return false
+	}
+	request.cancel()
+	// Interrupt the blocked read or write before the handler can release its connection.
+	_ = request.setDeadline(time.Now())
+	return true
 }
 
 func (h *hub) upload(w http.ResponseWriter, r *http.Request, desktop bool) {
@@ -503,19 +539,33 @@ func (h *hub) upload(w http.ResponseWriter, r *http.Request, desktop bool) {
 		apiError(w, http.StatusConflict, "会话已经切换，请重新选择文件。")
 		return
 	}
-	record, status, message := h.stage(current, id, cleanFilename(providedName), sender, r.ContentLength, r.Body)
+	name := cleanFilename(providedName)
+	caption := "正在接收 " + name
+	if desktop {
+		caption = "正在准备 " + name
+	}
+	request := newFileRequest(r.Context(), caption, http.NewResponseController(w).SetReadDeadline)
+	defer request.cancel()
+	record, status, message := h.stage(request.ctx, current, id, name, sender, r.ContentLength, r.Body, request)
 	if message != "" {
+		if request.ctx.Err() != nil {
+			w.Header().Set("Connection", "close")
+		}
 		apiError(w, status, message)
 		return
 	}
 	writeJSON(w, status, record)
 }
 
-func (h *hub) stage(current *room, id, name, sender string, length int64, body io.Reader) (*transfer, int, string) {
+func (h *hub) stage(ctx context.Context, current *room, id, name, sender string, length int64, body io.Reader, request *fileRequest) (*transfer, int, string) {
 	const diskReserve = 512 << 20
 	desktop := sender == "desktop"
 	size := uint64(length)
 	h.mu.Lock()
+	if ctx.Err() != nil {
+		h.mu.Unlock()
+		return nil, http.StatusConflict, transferCanceled
+	}
 	if h.stopping || h.room != current {
 		h.mu.Unlock()
 		return nil, http.StatusConflict, "会话已经切换，请重新选择文件。"
@@ -543,9 +593,9 @@ func (h *hub) stage(current *room, id, name, sender string, length int64, body i
 	}
 	current.uploading[id] = true
 	h.reservedBytes += size
-	h.startFileOperation(current, desktop)
+	h.startFileOperation(current, desktop, request)
 	h.mu.Unlock()
-	defer h.finishFileOperation(current, desktop)
+	defer h.finishFileOperation(current, desktop, request)
 	defer func() {
 		h.mu.Lock()
 		delete(current.uploading, id)
@@ -563,14 +613,22 @@ func (h *hub) stage(current *room, id, name, sender string, length int64, body i
 			os.Remove(temp.Name())
 		}
 	}()
-	written, copyErr := io.Copy(temp, io.LimitReader(body, length))
+	input := transferReader{ctx: ctx, stopped: h.stop, input: body}
+	written, copyErr := io.Copy(temp, io.LimitReader(input, length))
 	closeErr := temp.Close()
+	if ctx.Err() != nil {
+		return nil, http.StatusConflict, transferCanceled
+	}
 	if copyErr != nil || closeErr != nil || written != length {
 		return nil, http.StatusBadRequest, "文件未完整写入，请检查连接和电脑存储空间后重试。"
 	}
 
 	record := &transfer{ID: id, Name: name, Size: written, Sender: sender, CreatedAt: time.Now(), path: temp.Name()}
 	h.mu.Lock()
+	if ctx.Err() != nil {
+		h.mu.Unlock()
+		return nil, http.StatusConflict, transferCanceled
+	}
 	if h.room != current || h.stopping {
 		h.mu.Unlock()
 		return nil, http.StatusConflict, "会话已经结束，请重新连接。"
@@ -586,9 +644,29 @@ func (h *hub) stage(current *room, id, name, sender string, length int64, body i
 	}
 	current.byID[id] = record
 	current.files = append(current.files, record)
+	if request != nil {
+		request.committed = true
+	}
 	keep = true
 	h.mu.Unlock()
 	return record, http.StatusCreated, ""
+}
+
+type transferReader struct {
+	ctx     context.Context
+	stopped <-chan struct{}
+	input   io.Reader
+}
+
+func (r transferReader) Read(p []byte) (int, error) {
+	select {
+	case <-r.ctx.Done():
+		return 0, r.ctx.Err()
+	case <-r.stopped:
+		return 0, context.Canceled
+	default:
+		return r.input.Read(p)
+	}
 }
 
 func commitInbox(temp, dir, name string) (string, error) {
@@ -639,9 +717,16 @@ func (h *hub) download(w http.ResponseWriter, r *http.Request, desktop bool) {
 		http.NotFound(w, r)
 		return
 	}
-	h.startFileOperation(current, desktop)
+	var request *fileRequest
+	// The older Android app writes directly to the chosen document. Let it finish
+	// unless the client confirms that it can safely discard a partial download.
+	if desktop || h.bound.ID == "" || r.Header.Get("X-Download-Cancel") == "1" {
+		request = newFileRequest(r.Context(), "正在发送 "+record.Name, http.NewResponseController(w).SetWriteDeadline)
+		defer request.cancel()
+	}
+	h.startFileOperation(current, desktop, request)
 	h.mu.Unlock()
-	defer h.finishFileOperation(current, desktop)
+	defer h.finishFileOperation(current, desktop, request)
 
 	file, err := os.Open(record.path)
 	if err != nil {
@@ -652,6 +737,9 @@ func (h *hub) download(w http.ResponseWriter, r *http.Request, desktop bool) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": record.Name}))
 	http.ServeContent(w, r, record.Name, record.CreatedAt, file)
+	if request != nil && request.ctx.Err() != nil {
+		panic(http.ErrAbortHandler)
+	}
 }
 
 func cleanFilename(name string) string {

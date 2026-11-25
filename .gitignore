@@ -22,5 +22,6 @@ __pycache__/
 .env.*
 binding.dat
 widget.json
+inbox.txt
 local.properties
 *.log

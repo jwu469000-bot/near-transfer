@@ -34,14 +34,6 @@ func main() {
 	if *dataDir == "" {
 		*dataDir = filepath.Join(os.Getenv("LOCALAPPDATA"), "NearTransfer")
 	}
-	if *inbox == "" {
-		dir, err := downloadsFolder()
-		if err != nil {
-			home, _ := os.UserHomeDir()
-			dir = filepath.Join(home, "Downloads")
-		}
-		*inbox = filepath.Join(dir, "近传")
-	}
 	if err := run(*port, *noOpen, *dataDir, *inbox); err != nil {
 		fmt.Fprintln(os.Stderr, "NearTransfer:", err)
 		if !*noOpen {
@@ -49,6 +41,30 @@ func main() {
 		}
 		os.Exit(1)
 	}
+}
+
+func inboxLocation(dataDir, override string) (string, error) {
+	if override != "" {
+		return override, nil
+	}
+	config := filepath.Join(dataDir, "inbox.txt")
+	raw, err := os.ReadFile(config)
+	if err == nil {
+		dir := strings.TrimSpace(strings.TrimPrefix(string(raw), "\ufeff"))
+		if !filepath.IsAbs(dir) || strings.ContainsRune(dir, 0) {
+			return "", fmt.Errorf("收件箱设置需要完整路径，请检查 %s", config)
+		}
+		return filepath.Clean(dir), nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("无法读取收件箱设置：%w", err)
+	}
+	dir, err := downloadsFolder()
+	if err != nil {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, "Downloads")
+	}
+	return filepath.Join(dir, "近传"), nil
 }
 
 func run(port int, noOpen bool, dataDir, inbox string) error {
@@ -61,6 +77,10 @@ func run(port int, noOpen bool, dataDir, inbox string) error {
 			return err
 		}
 		defer release()
+	}
+	inbox, err := inboxLocation(dataDir, inbox)
+	if err != nil {
+		return err
 	}
 	listener, err := net.Listen("tcp4", net.JoinHostPort("0.0.0.0", strconv.Itoa(port)))
 	if err != nil && port != 0 {

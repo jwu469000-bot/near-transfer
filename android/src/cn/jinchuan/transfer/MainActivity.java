@@ -35,6 +35,9 @@ import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashSet;
@@ -71,12 +74,13 @@ public final class MainActivity extends Activity {
     private SharedPreferences prefs;
     private TransferApi.Session session;
     private TransferApi.State state;
-    private TransferApi.Record pendingSave;
+    private FileTransfer fileTransfer;
+    private PendingDownload pendingDownload;
+    private boolean choosingDestination;
     private boolean visible;
     private boolean online;
     private boolean polling;
     private boolean pairing;
-    private boolean transferring;
     private boolean leaving;
     private int filter;
     private String rendered = "";
@@ -84,8 +88,13 @@ public final class MainActivity extends Activity {
     private String addressDraft = "";
     private TextView status;
     private TextView message;
+    private LinearLayout progressPanel;
     private TextView progressText;
     private ProgressBar progress;
+    private Button cancelButton;
+    private final Runnable hideTransferResult = () -> {
+        if (fileTransfer == null && progressPanel != null) progressPanel.setVisibility(View.GONE);
+    };
     private Button scan;
     private Button connect;
     private Button chooseFiles;
@@ -97,6 +106,16 @@ public final class MainActivity extends Activity {
     private LinearLayout historyRows;
     private Button[] filters;
 
+    private static final class PendingDownload {
+        final String name;
+        final File staged;
+
+        PendingDownload(String name, File staged) {
+            this.name = name;
+            this.staged = staged;
+        }
+    }
+
     @Override
     protected void onCreate(Bundle saved) {
         super.onCreate(saved);
@@ -104,9 +123,17 @@ public final class MainActivity extends Activity {
         session = TransferApi.restore(prefs.getString("origin", null), prefs.getString("device-id", null),
                 prefs.getString("device-key", null));
         addressDraft = prefs.getString("last-address", "");
-        if (saved != null && saved.containsKey("save-id")) {
-            pendingSave = new TransferApi.Record(saved.getString("save-id"), saved.getString("save-name"),
-                    saved.getLong("save-size"), saved.getBoolean("save-incoming"));
+        if (session != null && saved != null) {
+            String cached = saved.getString("download-file", "");
+            if (cached.startsWith("near-in-") && cached.endsWith(".part") && cached.equals(new File(cached).getName())) {
+                File staged = new File(getCacheDir(), cached);
+                if (staged.isFile()) {
+                    pendingDownload = new PendingDownload(saved.getString("download-name", "文件"), staged);
+                    choosingDestination = saved.getBoolean("download-picker");
+                    fileTransfer = new FileTransfer();
+                    fileTransfer.finish();
+                }
+            }
         }
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         if (Build.VERSION.SDK_INT >= 30) {
@@ -120,6 +147,7 @@ public final class MainActivity extends Activity {
         super.onStart();
         visible = true;
         handler.post(pollTask);
+        if (pendingDownload != null && !choosingDestination) pickDestination();
     }
 
     @Override
@@ -132,30 +160,34 @@ public final class MainActivity extends Activity {
     @Override
     protected void onSaveInstanceState(Bundle out) {
         super.onSaveInstanceState(out);
-        if (pendingSave != null) {
-            out.putString("save-id", pendingSave.id);
-            out.putString("save-name", pendingSave.name);
-            out.putLong("save-size", pendingSave.size);
-            out.putBoolean("save-incoming", pendingSave.incoming);
+        if (pendingDownload != null) {
+            out.putString("download-file", pendingDownload.staged.getName());
+            out.putString("download-name", pendingDownload.name);
+            out.putBoolean("download-picker", choosingDestination);
         }
     }
 
     @Override
     protected void onDestroy() {
         if (textDialog != null) textDialog.dialog.dismiss();
-        handler.removeCallbacksAndMessages(null);
+        if (fileTransfer != null) fileTransfer.cancel();
+        if (isFinishing() && pendingDownload != null) pendingDownload.staged.delete();
+        // Already posted download results still need to release their cache files.
+        handler.removeCallbacks(pollTask);
+        handler.removeCallbacks(hideTransferResult);
         connectionWorker.shutdownNow();
-        fileWorker.shutdownNow();
+        fileWorker.shutdown();
         super.onDestroy();
     }
 
     private void showScreen() {
         rendered = "";
+        LinearLayout screen = column();
+        screen.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, new int[]{0xfff0f0fc, CANVAS, CANVAS}));
         ScrollView root = new ScrollView(this);
         root.setFillViewport(true);
-        root.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, new int[]{0xfff0f0fc, CANVAS, CANVAS}));
         if (Build.VERSION.SDK_INT >= 30) {
-            root.setOnApplyWindowInsetsListener((view, insets) -> {
+            screen.setOnApplyWindowInsetsListener((view, insets) -> {
                 android.graphics.Insets bars = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
                 int keyboard = insets.getInsets(WindowInsets.Type.ime()).bottom;
                 view.setPadding(bars.left, bars.top, bars.right, Math.max(bars.bottom, keyboard));
@@ -167,6 +199,7 @@ public final class MainActivity extends Activity {
         int pageEdge = Math.max(dp(16), (getResources().getDisplayMetrics().widthPixels - dp(620)) / 2);
         page.setPadding(pageEdge, dp(7), pageEdge, dp(20));
         root.addView(page, new ScrollView.LayoutParams(-1, -2));
+        screen.addView(root, new LinearLayout.LayoutParams(-1, 0, 1));
 
         LinearLayout toolbar = row();
         ImageView mark = image(R.drawable.near_brand);
@@ -193,8 +226,13 @@ public final class MainActivity extends Activity {
         message.setVisibility(hint.isEmpty() ? View.GONE : View.VISIBLE);
         add(page, message, 12);
 
-        if (session == null) buildPairing(page);
-        else buildTransfers(page);
+        if (session == null) {
+            buildPairing(page);
+        } else {
+            buildTransfers(page);
+            buildProgress(screen, pageEdge);
+            if (pendingDownload != null) showSaveProgress("请选择保存位置");
+        }
 
         LinearLayout footer = row();
         ImageView wifi = image(R.drawable.near_wifi);
@@ -209,7 +247,7 @@ public final class MainActivity extends Activity {
             footer.addView(settings, new LinearLayout.LayoutParams(-2, dp(44)));
         }
         add(page, footer, 12);
-        setContentView(root);
+        setContentView(screen);
         page.requestFocus();
         renderStatus();
     }
@@ -294,14 +332,6 @@ public final class MainActivity extends Activity {
         well.addView(chooseFiles, chooseParams);
         add(sender, well, 12);
 
-        progressText = label("", 12, MUTED, false);
-        progressText.setVisibility(View.GONE);
-        add(sender, progressText, 10);
-        progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        progress.setProgressTintList(ColorStateList.valueOf(BRAND));
-        progress.setMax(100);
-        progress.setVisibility(View.GONE);
-        add(sender, progress, 4, 7);
         add(page, sender, 19);
 
         LinearLayout history = card();
@@ -425,7 +455,7 @@ public final class MainActivity extends Activity {
             status.setText(online ? "已连接电脑" : "自动重连中");
             status.setTextColor(online ? GREEN : 0xff8a5b29);
             status.setBackground(surface(online ? MINT : 0xffffedd7, Color.TRANSPARENT, 99));
-            chooseFiles.setEnabled(online && !transferring && !leaving);
+            chooseFiles.setEnabled(online && fileTransfer == null && !leaving);
             renderTextButton();
         }
     }
@@ -647,7 +677,7 @@ public final class MainActivity extends Activity {
     private void renderFiles() {
         if (session == null) return;
         List<TransferApi.Record> files = state == null ? new ArrayList<>() : state.files;
-        StringBuilder key = new StringBuilder().append(filter).append(online).append(transferring).append(leaving);
+        StringBuilder key = new StringBuilder().append(filter).append(online).append(fileTransfer != null).append(leaving);
         for (TransferApi.Record file : files) key.append(file.id);
         if (rendered.equals(key.toString())) return;
         rendered = key.toString();
@@ -696,8 +726,8 @@ public final class MainActivity extends Activity {
         Button download = button("下载", BRAND, LILAC, true);
         download.setTextSize(13);
         download.setContentDescription("下载 " + file.name);
-        download.setEnabled(online && !transferring && !leaving);
-        download.setOnClickListener(v -> pickDestination(file));
+        download.setEnabled(online && fileTransfer == null && !leaving);
+        download.setOnClickListener(v -> download(file));
         item.addView(download, new LinearLayout.LayoutParams(dp(61), dp(45)));
         add(historyRows, item, 0);
     }
@@ -712,18 +742,21 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void pickDestination(TransferApi.Record record) {
-        pendingSave = record;
-        int dot = record.name.lastIndexOf('.');
+    private void pickDestination() {
+        String name = pendingDownload.name;
+        int dot = name.lastIndexOf('.');
         String type = dot < 0 ? null : MimeTypeMap.getSingleton()
-                .getMimeTypeFromExtension(record.name.substring(dot + 1).toLowerCase(Locale.ROOT));
+                .getMimeTypeFromExtension(name.substring(dot + 1).toLowerCase(Locale.ROOT));
         Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT).setType(type == null ? "application/octet-stream" : type);
-        intent.addCategory(Intent.CATEGORY_OPENABLE).putExtra(Intent.EXTRA_TITLE, record.name);
+        intent.addCategory(Intent.CATEGORY_OPENABLE).putExtra(Intent.EXTRA_TITLE, name);
+        choosingDestination = true;
         try {
             startActivityForResult(intent, SAVE);
         } catch (RuntimeException unavailable) {
-            pendingSave = null;
-            showHint("此手机上无法打开系统文件选择器。");
+            pendingDownload.staged.delete();
+            pendingDownload = null;
+            choosingDestination = false;
+            finishProgress(fileTransfer, "此手机上无法打开系统文件选择器。", true);
         }
     }
 
@@ -752,92 +785,172 @@ public final class MainActivity extends Activity {
             if (data.getData() != null) chosen.add(data.getData());
             if (!chosen.isEmpty()) sendFiles(new ArrayList<>(chosen));
         } else if (request == SAVE) {
-            TransferApi.Record record = pendingSave;
-            pendingSave = null;
-            if (record != null && result == RESULT_OK && data != null && data.getData() != null) download(record, data.getData());
+            PendingDownload downloaded = pendingDownload;
+            pendingDownload = null;
+            choosingDestination = false;
+            if (downloaded == null) return;
+            if (result == RESULT_OK && data != null && data.getData() != null) {
+                saveDownload(downloaded, data.getData());
+            } else {
+                downloaded.staged.delete();
+                finishProgress(fileTransfer, "已取消保存。", false);
+            }
         }
     }
 
     private void sendFiles(List<Uri> files) {
         TransferApi.Session current = session;
-        if (current == null || state == null || transferring) {
+        if (current == null || state == null || fileTransfer != null || leaving) {
             showHint("请连接电脑后重新选择文件。");
             return;
         }
         int room = state.room;
-        startProgress("正在准备 " + files.size() + " 个文件");
+        FileTransfer transfer = startProgress("正在准备 " + files.size() + " 个文件");
         fileWorker.execute(() -> {
             int sent = 0;
             for (int i = 0; i < files.size(); i++) {
                 String batch = " (" + (i + 1) + "/" + files.size() + ")";
-                try (FileAccess.Source source = FileAccess.from(this, files.get(i))) {
+                try (FileAccess.Source source = FileAccess.from(this, files.get(i), transfer)) {
                     String caption = "发送 " + source.name + batch;
-                    updateUI(() -> { if (session == current) reportProgress(caption, 0); });
-                    TransferApi.send(current, room, source, (done, total) -> updateUI(() -> {
-                        if (session == current) reportProgress(caption, percent(done, total));
-                    }));
+                    updateUI(() -> reportProgress(transfer, caption, 0));
+                    TransferApi.send(current, room, source, transfer,
+                            (done, total) -> updateUI(() -> reportProgress(transfer, caption, percent(done, total))));
                     sent++;
                 } catch (Exception error) {
+                    boolean failed = transfer.finish();
                     String prefix = sent == 0 ? "" : "已发送 " + sent + " 个文件。";
-                    updateUI(() -> {
-                        if (session == current) finishProgress(prefix + transferMessage(error, "发送中断，请重新选择未发出的文件。"), true);
-                    });
+                    String detail = failed ? transferMessage(error, "发送中断，请重新选择未发出的文件。") : "传输已取消。";
+                    updateUI(() -> finishProgress(transfer, prefix + detail, failed));
                     return;
                 }
             }
-            updateUI(() -> { if (session == current) finishProgress("电脑收件箱已收到 " + files.size() + " 个文件。", false); });
+            transfer.finish();
+            updateUI(() -> finishProgress(transfer, "电脑收件箱已收到 " + files.size() + " 个文件。", false));
         });
     }
 
-    private void download(TransferApi.Record record, Uri uri) {
-        FileAccess.Destination destination = new FileAccess.Destination(getContentResolver(), uri);
+    private void download(TransferApi.Record record) {
         TransferApi.Session current = session;
-        if (current == null) {
-            fileWorker.execute(destination::discard);
-            showHint("连接已结束，请重新连接后下载。");
-            return;
-        }
+        if (current == null || fileTransfer != null || leaving) return;
         String caption = "下载 " + record.name;
-        startProgress(caption);
+        FileTransfer transfer = startProgress(caption);
         fileWorker.execute(() -> {
+            File staged = null;
             try {
-                TransferApi.receive(current, record, destination, (done, total) -> updateUI(() -> {
-                    if (session == current) reportProgress(caption, percent(done, total));
-                }));
-                updateUI(() -> { if (session == current) finishProgress("已保存 " + record.name, false); });
-            } catch (Exception error) {
-                destination.discard();
-                updateUI(() -> {
-                    if (session == current) finishProgress(transferMessage(error, "保存失败，请检查网络和手机存储空间。"), true);
+                transfer.check();
+                File cache = getCacheDir();
+                if (record.size > cache.getUsableSpace()) {
+                    boolean failed = transfer.finish();
+                    updateUI(() -> finishProgress(transfer,
+                            failed ? "手机可用空间不足，无法暂存文件。" : "传输已取消。", failed));
+                    return;
+                }
+                staged = File.createTempFile("near-in-", ".part", cache);
+                try (OutputStream out = new FileOutputStream(staged)) {
+                    TransferApi.receive(current, record, out, transfer,
+                            (done, total) -> updateUI(() -> reportProgress(transfer, caption, percent(done, total))));
+                }
+                transfer.finish();
+                transfer.check();
+                File downloaded = staged;
+                boolean posted = handler.post(() -> {
+                    if (isDestroyed() || fileTransfer != transfer) {
+                        downloaded.delete();
+                        return;
+                    }
+                    pendingDownload = new PendingDownload(record.name, downloaded);
+                    showSaveProgress("请选择保存位置");
+                    if (visible) pickDestination();
                 });
+                if (!posted) downloaded.delete();
+            } catch (Exception error) {
+                if (staged != null) staged.delete();
+                boolean failed = transfer.finish();
+                String result = failed ? transferMessage(error, "下载中断，请检查连接和手机存储空间后重试。") : "传输已取消。";
+                updateUI(() -> finishProgress(transfer, result, failed));
             }
         });
     }
 
-    private void startProgress(String caption) {
-        transferring = true;
-        showHint("");
-        progress.setVisibility(View.VISIBLE);
-        progressText.setVisibility(View.VISIBLE);
-        progressText.setTextColor(MUTED);
-        reportProgress(caption, 0);
-        renderStatus();
-        renderFiles();
+    private void saveDownload(PendingDownload downloaded, Uri uri) {
+        FileTransfer transfer = fileTransfer;
+        showSaveProgress("正在保存 " + downloaded.name);
+        fileWorker.execute(() -> {
+            try {
+                FileAccess.saveDownload(getContentResolver(), uri, downloaded.staged);
+                updateUI(() -> finishProgress(transfer, "已保存 " + downloaded.name, false));
+            } catch (Exception error) {
+                updateUI(() -> finishProgress(transfer, "未能完整保存，请检查所选位置后重试。", true));
+            } finally {
+                downloaded.staged.delete();
+            }
+        });
     }
 
-    private void reportProgress(String caption, int percent) {
-        if (session == null || !transferring) return;
+    private void buildProgress(LinearLayout screen, int pageEdge) {
+        progressPanel = card();
+        progressPanel.setPadding(dp(13), dp(6), dp(7), dp(9));
+        LinearLayout header = row();
+        progressText = label("", 13, MUTED, false);
+        progressText.setSingleLine(true);
+        progressText.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(0, -2, 1);
+        textParams.rightMargin = dp(8);
+        header.addView(progressText, textParams);
+        cancelButton = button("取消", 0xffa0443d, 0xfffff0ee, true);
+        cancelButton.setOnClickListener(view -> {
+            if (fileTransfer != null && fileTransfer.cancel()) {
+                cancelButton.setEnabled(false);
+                progressText.setText("正在取消传输…");
+            }
+        });
+        header.addView(cancelButton, new LinearLayout.LayoutParams(dp(64), dp(48)));
+        add(progressPanel, header, 0, 48);
+        progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        progress.setProgressTintList(ColorStateList.valueOf(BRAND));
+        progress.setMax(100);
+        add(progressPanel, progress, 2, 7);
+        progressPanel.setVisibility(View.GONE);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+        params.setMargins(pageEdge, dp(5), pageEdge, dp(8));
+        screen.addView(progressPanel, params);
+    }
+
+    private FileTransfer startProgress(String caption) {
+        fileTransfer = new FileTransfer();
+        handler.removeCallbacks(hideTransferResult);
+        showHint("");
+        progressPanel.setVisibility(View.VISIBLE);
+        progress.setVisibility(View.VISIBLE);
+        cancelButton.setVisibility(View.VISIBLE);
+        cancelButton.setEnabled(true);
+        progressText.setTextColor(MUTED);
+        reportProgress(fileTransfer, caption, 0);
+        renderStatus();
+        renderFiles();
+        return fileTransfer;
+    }
+
+    private void reportProgress(FileTransfer transfer, String caption, int percent) {
+        if (fileTransfer != transfer || transfer.isCanceled()) return;
         progress.setProgress(percent);
         progressText.setText(caption + " · " + percent + "%");
     }
 
-    private void finishProgress(String caption, boolean failed) {
-        transferring = false;
-        if (session == null) return;
+    private void showSaveProgress(String caption) {
+        progressPanel.setVisibility(View.VISIBLE);
         progress.setVisibility(View.GONE);
-        progressText.setVisibility(View.VISIBLE);
-        progressText.setTextColor(failed ? 0xffa0443d : GREEN);
+        cancelButton.setVisibility(View.GONE);
+        progressText.setTextColor(MUTED);
         progressText.setText(caption);
+    }
+
+    private void finishProgress(FileTransfer transfer, String caption, boolean failed) {
+        if (transfer == null || fileTransfer != transfer || session == null) return;
+        fileTransfer = null;
+        showSaveProgress(caption);
+        progressText.setTextColor(failed ? 0xffa0443d : transfer.isCanceled() ? MUTED : GREEN);
+        handler.postDelayed(hideTransferResult, 7000);
         renderStatus();
         renderFiles();
         poll();
@@ -854,7 +967,7 @@ public final class MainActivity extends Activity {
 
     private void updateAddress() {
         TransferApi.Session current = session;
-        if (current == null || transferring) {
+        if (current == null || fileTransfer != null) {
             showHint("请等待当前文件传输完成。");
             return;
         }
@@ -885,7 +998,7 @@ public final class MainActivity extends Activity {
 
     private void askLeave() {
         if (leaving) return;
-        if (transferring) {
+        if (fileTransfer != null) {
             showHint("请等待当前文件传输完成后再更换连接。");
             return;
         }
@@ -921,7 +1034,8 @@ public final class MainActivity extends Activity {
         state = null;
         seenText = "";
         online = false;
-        transferring = false;
+        if (fileTransfer != null) fileTransfer.cancel();
+        fileTransfer = null;
         filter = 0;
         hint = notice;
         prefs.edit().remove("origin").remove("device-id").remove("device-key").remove("cookie").apply();
@@ -931,7 +1045,8 @@ public final class MainActivity extends Activity {
     private void showHelp() {
         new AlertDialog.Builder(this).setTitle("使用近传")
                 .setMessage("让手机和电脑连上同一个 Wi‑Fi。首次使用时扫码或输入配对码，之后打开两端近传会自动重连。\n\n"
-                        + "手机发来的文件会自动进入电脑收件箱。收到电脑文件时，点“下载”选择手机上的保存位置。\n\n"
+                        + "手机发来的文件会自动进入电脑收件箱。点“下载”接收电脑发来的文件，下载完成后选择保存位置。"
+                        + "收发过程中可点进度条旁的“取消”。\n\n"
                         + "如果无法连接，请检查 Windows 防火墙设置。传输时请保持电脑端程序开启。")
                 .setPositiveButton("知道了", null).show();
     }

@@ -5,7 +5,7 @@ import android.content.Context;
 import android.content.res.AssetFileDescriptor;
 import android.database.Cursor;
 import android.net.Uri;
-import android.provider.DocumentsContract;
+import android.os.CancellationSignal;
 import android.provider.OpenableColumns;
 
 import java.io.File;
@@ -31,9 +31,9 @@ final class FileAccess {
             this.staged = staged;
         }
 
-        InputStream open() throws IOException {
+        InputStream open(CancellationSignal signal) throws IOException {
             if (staged != null) return new FileInputStream(staged);
-            return openInput(resolver, uri);
+            return openInput(resolver, uri, signal);
         }
 
         @Override
@@ -42,11 +42,13 @@ final class FileAccess {
         }
     }
 
-    static Source from(Context context, Uri uri) throws IOException {
+    static Source from(Context context, Uri uri, FileTransfer transfer) throws IOException {
+        transfer.check();
         ContentResolver resolver = context.getContentResolver();
         String name = "文件";
         long size = -1;
-        try (Cursor cursor = resolver.query(uri, new String[]{OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE}, null, null, null)) {
+        try (Cursor cursor = resolver.query(uri, new String[]{OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE},
+                null, null, null, transfer.storage)) {
             if (cursor != null && cursor.moveToFirst()) {
                 int nameColumn = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
                 int sizeColumn = cursor.getColumnIndex(OpenableColumns.SIZE);
@@ -55,20 +57,27 @@ final class FileAccess {
             }
         }
         if (size < 0) {
-            try (AssetFileDescriptor descriptor = resolver.openAssetFileDescriptor(uri, "r")) {
+            try (AssetFileDescriptor descriptor = resolver.openAssetFileDescriptor(uri, "r", transfer.storage)) {
                 if (descriptor != null) size = descriptor.getLength();
             }
         }
+        transfer.check();
         if (size >= 0) return new Source(resolver, uri, name, size, null);
 
         File staged = File.createTempFile("near-out-", ".part", context.getCacheDir());
         boolean keep = false;
         try {
-            try (InputStream in = openInput(resolver, uri); OutputStream out = new FileOutputStream(staged)) {
+            try (InputStream in = openInput(resolver, uri, transfer.storage); OutputStream out = new FileOutputStream(staged)) {
                 byte[] buffer = new byte[128 * 1024];
-                int length;
-                while ((length = in.read(buffer)) >= 0) out.write(buffer, 0, length);
+                while (true) {
+                    transfer.check();
+                    int length = in.read(buffer);
+                    if (length == -1) break;
+                    transfer.check();
+                    out.write(buffer, 0, length);
+                }
             }
+            transfer.check();
             keep = true;
             return new Source(resolver, uri, name, staged.length(), staged);
         } finally {
@@ -76,33 +85,23 @@ final class FileAccess {
         }
     }
 
-    static final class Destination {
-        private final ContentResolver resolver;
-        private final Uri uri;
-
-        Destination(ContentResolver resolver, Uri uri) {
-            this.resolver = resolver;
-            this.uri = uri;
-        }
-
-        OutputStream open() throws IOException {
-            OutputStream out = resolver.openOutputStream(uri, "w");
+    static void saveDownload(ContentResolver resolver, Uri uri, File staged) throws IOException {
+        try (InputStream in = new FileInputStream(staged); OutputStream out = resolver.openOutputStream(uri, "wt")) {
             if (out == null) throw new IOException("无法写入选定的位置。");
-            return out;
-        }
-
-        void discard() {
-            try {
-                DocumentsContract.deleteDocument(resolver, uri);
-            } catch (IOException | RuntimeException ignored) {
-                // Some providers cannot delete a partially written document.
-            }
+            byte[] buffer = new byte[128 * 1024];
+            int length;
+            while ((length = in.read(buffer)) != -1) out.write(buffer, 0, length);
         }
     }
 
-    private static InputStream openInput(ContentResolver resolver, Uri uri) throws IOException {
-        InputStream in = resolver.openInputStream(uri);
-        if (in == null) throw new IOException("无法读取选中的文件。");
-        return in;
+    private static InputStream openInput(ContentResolver resolver, Uri uri, CancellationSignal signal) throws IOException {
+        AssetFileDescriptor descriptor = resolver.openAssetFileDescriptor(uri, "r", signal);
+        if (descriptor == null) throw new IOException("无法读取选中的文件。");
+        try {
+            return descriptor.createInputStream();
+        } catch (IOException | RuntimeException error) {
+            descriptor.close();
+            throw error;
+        }
     }
 }

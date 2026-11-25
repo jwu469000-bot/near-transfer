@@ -292,9 +292,10 @@ final class TransferApi {
         }
     }
 
-    static void send(Session session, int room, FileAccess.Source source, Progress progress) throws IOException {
+    static void send(Session session, int room, FileAccess.Source source, FileTransfer transfer, Progress progress) throws IOException {
         Route route = session.route;
         HttpURLConnection request = open(route.origin, "/api/upload", "POST", route.ticket);
+        transfer.attach(request);
         try {
             request.setDoOutput(true);
             request.setFixedLengthStreamingMode(source.size);
@@ -302,25 +303,34 @@ final class TransferApi {
             request.setRequestProperty("X-File-Name", Uri.encode(source.name));
             request.setRequestProperty("X-Room", String.valueOf(room));
             request.setRequestProperty("X-Transfer-Id", UUID.randomUUID().toString().replace("-", ""));
-            try (InputStream in = source.open(); OutputStream out = request.getOutputStream()) {
-                copy(in, out, source.size, progress);
+            request.setRequestProperty("Connection", "close");
+            try (InputStream in = source.open(transfer.storage)) {
+                transfer.check();
+                try (OutputStream out = request.getOutputStream()) {
+                    copy(in, out, source.size, transfer, progress);
+                }
             }
             requireSuccess(request);
         } finally {
+            transfer.detach();
             request.disconnect();
         }
     }
 
-    static void receive(Session session, Record record, FileAccess.Destination destination, Progress progress) throws IOException {
+    static void receive(Session session, Record record, OutputStream out, FileTransfer transfer, Progress progress) throws IOException {
         if (!record.id.matches("[dp][a-f0-9]{32}")) throw new IOException("文件记录无效。");
         Route route = session.route;
         HttpURLConnection request = open(route.origin, "/api/files/" + record.id, "GET", route.ticket);
+        transfer.attach(request);
         try {
+            request.setRequestProperty("Connection", "close");
+            request.setRequestProperty("X-Download-Cancel", "1");
             requireSuccess(request);
-            try (InputStream in = request.getInputStream(); OutputStream out = destination.open()) {
-                copy(in, out, record.size, progress);
+            try (InputStream in = request.getInputStream()) {
+                copy(in, out, record.size, transfer, progress);
             }
         } finally {
+            transfer.detach();
             request.disconnect();
         }
     }
@@ -399,12 +409,15 @@ final class TransferApi {
         return out.toString("UTF-8");
     }
 
-    private static void copy(InputStream in, OutputStream out, long total, Progress progress) throws IOException {
+    private static void copy(InputStream in, OutputStream out, long total, FileTransfer transfer, Progress progress) throws IOException {
         byte[] buffer = new byte[128 * 1024];
         long done = 0;
         long lastUpdate = 0;
-        int count;
-        while ((count = in.read(buffer)) != -1) {
+        while (true) {
+            transfer.check();
+            int count = in.read(buffer);
+            if (count == -1) break;
+            transfer.check();
             if (done > total - count) throw new IOException("文件大小在传输时发生了变化。");
             out.write(buffer, 0, count);
             done += count;

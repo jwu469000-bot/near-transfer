@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,8 +22,11 @@ const (
 	textAction
 	menuAction
 	collapseAction
+	cancelAction
 	expandAction
 )
+
+var cancelBounds = winRect{244, 49, 309, 76}
 
 type winPoint struct{ x, y int32 }
 type winRect struct{ left, top, right, bottom int32 }
@@ -68,6 +72,13 @@ type widgetPrefs struct {
 type widgetState struct {
 	paired, bound, online, network bool
 	room, received, receivedTexts  int
+	batch                          *fileBatch
+	request                        *fileRequest
+}
+
+type fileBatch struct {
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 type widget struct {
@@ -88,7 +99,7 @@ type widget struct {
 	view                widgetState
 
 	mu         sync.Mutex
-	busy       bool
+	batch      *fileBatch
 	notice     string
 	noticeTill time.Time
 }
@@ -200,10 +211,18 @@ func (h *hub) widgetStatus() (widgetState, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	current := h.room
+	var request *fileRequest
+	for _, active := range current.fileRequests {
+		if !active.committed && active.ctx.Err() == nil {
+			request = active
+			break
+		}
+	}
 	return widgetState{
 		paired: h.paired(), bound: h.bound.ID != "", network: len(h.endpoints) != 0,
 		online: current.phoneTransfers > 0 || time.Since(current.phoneSeen) < 14*time.Second,
 		room:   current.number, received: current.received, receivedTexts: current.receivedTexts,
+		request: request,
 	}, h.stopping
 }
 
@@ -220,18 +239,29 @@ func (w *widget) refresh() {
 		w.textView.refresh()
 	}
 	w.mu.Lock()
-	expired := w.notice != "" && !w.busy && time.Now().After(w.noticeTill)
+	view.batch = w.batch
+	expired := w.notice != "" && w.batch == nil && time.Now().After(w.noticeTill)
 	if expired {
 		w.notice = ""
 	}
 	w.mu.Unlock()
 	if w.view != view || expired {
 		w.view = view
+		if w.focus == cancelAction && !w.canCancel() {
+			w.focus = -1
+		}
 		w.redraw()
 	}
 }
 
 func (w *widget) redraw() { invalidateWindow.Call(w.hwnd, 0, 0) }
+
+func (w *widget) canCancel() bool {
+	if w.view.batch != nil {
+		return w.view.batch.ctx.Err() == nil
+	}
+	return w.view.request != nil
+}
 
 func (w *widget) action(x, y int32) int {
 	if !w.expanded {
@@ -245,6 +275,9 @@ func (w *widget) action(x, y int32) int {
 		return menuAction
 	case x >= w.px(235) && x < w.px(268) && y >= w.px(13) && y < w.px(46):
 		return collapseAction
+	case w.canCancel() && x >= w.px(cancelBounds.left) && x < w.px(cancelBounds.right) &&
+		y >= w.px(cancelBounds.top) && y < w.px(cancelBounds.bottom):
+		return cancelAction
 	case x >= w.px(14) && x < w.px(310) && y >= w.px(80) && y < w.px(150):
 		return sendAction
 	case y >= w.px(160) && x >= w.px(13) && x < w.px(311):
@@ -324,14 +357,18 @@ func widgetProc(window uintptr, message uint32, wParam, lParam uintptr) uintptr 
 				return 0
 			}
 			shift, _, _ := user32.NewProc("GetKeyState").Call(0x10)
+			last := collapseAction
+			if w.canCancel() {
+				last = cancelAction
+			}
 			if int16(shift) < 0 {
-				if w.focus < 0 {
-					w.focus = collapseAction
+				if w.focus <= 0 {
+					w.focus = last
 				} else {
-					w.focus = (w.focus + collapseAction) % (collapseAction + 1)
+					w.focus--
 				}
 			} else {
-				w.focus = (w.focus + 1) % (collapseAction + 1)
+				w.focus = (w.focus + 1) % (last + 1)
 			}
 			w.redraw()
 		case 13, 32:
@@ -410,7 +447,24 @@ func (w *widget) activate(action int) {
 		w.menu()
 	case collapseAction:
 		w.setExpanded(false)
+	case cancelAction:
+		w.cancelTransfer()
 	}
+}
+
+func (w *widget) cancelTransfer() {
+	if batch := w.view.batch; batch != nil {
+		w.mu.Lock()
+		if w.batch == batch {
+			batch.cancel()
+		}
+		w.mu.Unlock()
+	} else if request := w.view.request; request != nil && w.h.cancelFileRequest(request) {
+		w.setNotice(transferCanceled)
+	}
+	w.focus = -1
+	w.refresh()
+	w.redraw()
 }
 
 func (w *widget) setup() {
@@ -532,18 +586,22 @@ func (w *widget) sendFiles(files []string) {
 		return
 	}
 	w.mu.Lock()
-	if w.busy {
+	if w.batch != nil {
 		w.mu.Unlock()
-		w.setNotice("请等当前文件准备完成")
 		return
 	}
-	w.busy = true
+	ctx, cancel := context.WithCancel(context.Background())
+	w.batch = &fileBatch{ctx: ctx, cancel: cancel}
 	w.mu.Unlock()
 	w.setNotice("正在准备发送…")
 	go func() {
+		defer cancel()
 		sent := 0
 		var lastError string
 		for index, filename := range files {
+			if ctx.Err() != nil {
+				break
+			}
 			w.setNotice(fmt.Sprintf("正在准备第 %d / %d 个文件", index+1, len(files)))
 			file, err := os.Open(filename)
 			if err != nil {
@@ -556,23 +614,29 @@ func (w *widget) sendFiles(files []string) {
 				lastError = "可发送文件，文件夹可先压缩"
 				continue
 			}
-			_, _, lastError = w.h.stage(current, "d"+randomKey()[:32], cleanFilename(stat.Name()), "desktop", stat.Size(), file)
+			_, _, lastError = w.h.stage(ctx, current, "d"+randomKey()[:32], cleanFilename(stat.Name()), "desktop", stat.Size(), file, nil)
 			file.Close()
 			if lastError == "" {
 				sent++
 			}
 		}
 		w.mu.Lock()
-		w.busy = false
-		w.mu.Unlock()
+		w.batch = nil
 		switch {
 		case sent == len(files):
-			w.setNotice(fmt.Sprintf("已发送 %d 个文件 · 在手机上下载", sent))
+			w.notice = fmt.Sprintf("已发送 %d 个文件 · 在手机上下载", sent)
+		case ctx.Err() != nil && sent > 0:
+			w.notice = fmt.Sprintf("已发送 %d 个文件 · 已取消其余文件", sent)
+		case ctx.Err() != nil:
+			w.notice = transferCanceled
 		case sent > 0:
-			w.setNotice(fmt.Sprintf("已发送 %d 个，另有 %d 个需重试", sent, len(files)-sent))
+			w.notice = fmt.Sprintf("已发送 %d 个，另有 %d 个需重试", sent, len(files)-sent)
 		default:
-			w.setNotice(lastError)
+			w.notice = lastError
 		}
+		w.noticeTill = time.Now().Add(7 * time.Second)
+		w.mu.Unlock()
+		postWindowMessage.Call(w.hwnd, 0x8000, 0, 0)
 	}()
 }
 

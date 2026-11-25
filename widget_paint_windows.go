@@ -87,11 +87,27 @@ func (w *widget) paint(dc uintptr) {
 	w.mu.Lock()
 	notice := w.notice
 	w.mu.Unlock()
+	switch {
+	case w.view.batch != nil && w.view.batch.ctx.Err() != nil:
+		notice = "正在取消传输…"
+	case w.view.batch == nil && w.view.request != nil:
+		notice = w.view.request.caption
+	}
 	if notice != "" {
 		status, dot, statusText = notice, indigo, indigo
 	}
+	statusRight := int32(308)
+	if w.canCancel() {
+		statusRight = cancelBounds.left - 7
+		border := uint32(0xf2d9d6)
+		if w.focus == cancelAction {
+			border = 0xc16c65
+		}
+		c.round(cancelBounds.left, cancelBounds.top, cancelBounds.right, cancelBounds.bottom, 8, 0xfff0ee, border)
+		c.drawText("取消", cancelBounds, 12, 0xa0443d, true, 1)
+	}
 	c.round(17, 59, 24, 66, 7, dot, dot)
-	c.label(status, 32, 50, 308, 75, 12, statusText, false)
+	c.label(status, 32, 50, statusRight, 75, 12, statusText, false)
 
 	border := uint32(0xe7e3fc)
 	if w.focus == sendAction {
